@@ -1,6 +1,6 @@
 // 失物招领系统后端入口。
 //
-// 顺序（§6）：loadConfig → slog → pgxpool.New + Ping → 跑迁移 → repo → service → handler → 路由 → ListenAndServe
+// 顺序（§6）：loadConfig → slog → pgxpool.New + Ping → 跑迁移 → router.Setup（内部 repo → auth → service → handler → 路由）→ ListenAndServe
 // 每步失败都 fatal 并带上下文。整个文件刻意保持在 80 行以内、可通读：
 // 依赖全部手工按顺序 new，不用 wire/fx —— 生成代码和隐式魔法对初学者是调试黑洞。
 package main
@@ -47,10 +47,16 @@ func run() error {
 		return err
 	}
 
-	// M1 起在这里按 repo → service → handler 的顺序 new，再传给 router.Setup
+	// 依赖装配全部在 router.Setup 里面（§10：冒烟测试必须走和生产完全相同的装配路径，
+	// 所以不能有一部分只在 main.go 里发生）。main.go 只负责「起进程」这件事。
+	engine, err := router.Setup(cfg, pool)
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           router.Setup(cfg, pool),
+		Handler:           engine,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

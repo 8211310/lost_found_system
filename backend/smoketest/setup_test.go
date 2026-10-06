@@ -18,10 +18,13 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"lostfound/internal/apperr"
+	"lostfound/internal/auth"
 	"lostfound/internal/config"
 	"lostfound/internal/database"
 	"lostfound/internal/router"
@@ -118,12 +121,26 @@ func setup(dsn string) (*Harness, error) {
 	}
 
 	gin.SetMode(gin.TestMode) // 否则 gin 会把路由表打进测试输出，淹没真正的失败信息
-	engine := router.Setup(config.Config{Env: "test"}, pool)
+
+	// cfg 必须是**能通过 Setup 内部校验**的：M1 起 Setup 会真的 new 一个
+	// auth.TokenSigner，它拒绝空密钥和非正有效期。
+	// 密钥只活在这个测试进程里，和任何环境的真密钥无关。
+	cfg := config.Config{
+		Env:       "test",
+		JWTSecret: "smoketest-secret-0123456789abcdef0123456789abcdef",
+		JWTExpire: time.Hour,
+	}
+
+	engine, err := router.Setup(cfg, pool)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("装配路由失败: %w", err)
+	}
 
 	return &Harness{
 		Pool:   pool,
 		Server: httptest.NewServer(engine),
-		Cfg:    config.Config{Env: "test"},
+		Cfg:    cfg,
 	}, nil
 }
 
@@ -327,6 +344,101 @@ func RequireCode(t *testing.T, r Response, want string) {
 	if r.Code != want {
 		t.Fatalf("期望 code=%s，实际 code=%s（HTTP %d）\nmessage: %s\nrequest_id: %s\ndata: %s",
 			want, r.Code, r.HTTPStatus, r.Message, r.RequestID, truncate(string(r.Data)))
+	}
+}
+
+// RequireOK 是 RequireCode 的常用特例。
+func RequireOK(t *testing.T, r Response, what string) {
+	t.Helper()
+	if r.Code != apperr.CodeOK {
+		t.Fatalf("%s 失败：code=%s message=%s（HTTP %d）\nrequest_id: %s\ndata: %s",
+			what, r.Code, r.Message, r.HTTPStatus, r.RequestID, truncate(string(r.Data)))
+	}
+}
+
+// ---------- 登录态夹具 ----------
+
+// Session 是一个「已登录用户」。M2 之后几乎每条测试都要先有登录态，
+// 所以它和 RegisterAndLogin 放在这个共享文件里，而不是塞进 m1 的测试文件。
+type Session struct {
+	Token    string
+	UserID   int64
+	Username string
+	Nickname string
+	Role     string
+}
+
+// RegisterAndLogin 走完 #1 注册 + #2 登录，返回一个可用的登录态。
+//
+// 它刻意**不断言**这两个端点的契约（那是 m1_auth_test.go 的职责），
+// 只在出问题时 fatal 并打出完整响应。作为夹具，它的任务是「给我一个能用的 token」；
+// 把断言混进夹具的后果是：注册接口一坏，几十条本来在测别的东西的测试全部变红，
+// 而红的那一条真正的原因被埋在第一个失败里。
+func (h *Harness) RegisterAndLogin(t *testing.T, username, password string) Session {
+	t.Helper()
+
+	RequireOK(t, h.Post(t, "/api/auth/register", map[string]any{
+		"username": username,
+		"password": password,
+	}, ""), "夹具注册 "+username)
+
+	r := h.Post(t, "/api/auth/login", map[string]any{
+		"username": username,
+		"password": password,
+	}, "")
+	RequireOK(t, r, "夹具登录 "+username)
+
+	var data struct {
+		Token string `json:"token"`
+		User  struct {
+			ID       int64  `json:"id"`
+			Username string `json:"username"`
+			Nickname string `json:"nickname"`
+			Role     string `json:"role"`
+		} `json:"user"`
+	}
+	r.DataInto(t, &data)
+	if data.Token == "" {
+		t.Fatalf("夹具登录 %s 成功了，但 token 是空的", username)
+	}
+	return Session{
+		Token:    data.Token,
+		UserID:   data.User.ID,
+		Username: data.User.Username,
+		Nickname: data.User.Nickname,
+		Role:     data.User.Role,
+	}
+}
+
+// TokenFor 给任意 user id 铸一个有效 token，不走 #2 登录接口。
+//
+// 需要它的场合是「这个用户没法登录，但测试必须让他带着 token 发请求」：
+// SSO 账号（没有密码）、已被封禁的账号（登录会被拒）、admin（计划里没有
+// 「注册成 admin」的端点）。铸出来的 token 和生产签发的完全同源 ——
+// 同一个密钥、同一个 auth.TokenSigner 实现，所以中间件分不出区别，
+// 这正是「测的是真链路」的意思。
+func (h *Harness) TokenFor(t *testing.T, userID int64) string {
+	t.Helper()
+	signer, err := auth.NewTokenSigner(h.Cfg.JWTSecret, h.Cfg.JWTExpire)
+	if err != nil {
+		t.Fatalf("铸 token 失败（建 signer 出错）: %v", err)
+	}
+	tok, err := signer.Issue(userID)
+	if err != nil {
+		t.Fatalf("铸 token 失败: %v", err)
+	}
+	return tok.Value
+}
+
+// Ban 把一个用户封禁。
+//
+// 直接改库而不是走接口：M6 才有封禁端点，而 M1 就必须验证「封号立刻生效」
+// （role/status 不进 JWT claims 那个设计决定的验收点）。
+func (h *Harness) Ban(t *testing.T, userID int64) {
+	t.Helper()
+	if _, err := h.Pool.Exec(context.Background(),
+		`UPDATE users SET status = 'banned', updated_at = now() WHERE id = $1`, userID); err != nil {
+		t.Fatalf("封禁用户 %d 失败: %v", userID, err)
 	}
 }
 

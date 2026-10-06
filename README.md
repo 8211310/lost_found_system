@@ -244,7 +244,21 @@ bash scripts/smoke.sh
   验收实测：迁移 version 1；12 张业务表 + `schema_migrations`；`categories` 55 行、
   `locations` 91 行；`pg_trgm` 1.6 + 13 个索引；`/api/health` 返回 `"code":"OK"`
   且 `"db":"ok"`；集成测试 18 项全绿、`scripts/smoke.sh` 16 项全绿。
-- **未开工**：M1 认证 · M2 字典·物品·上传 · M3 匹配 · M4 解锁·通知·举报 ·
+- **M1 认证 —— 已完成并验收（2026-10-07）**
+  §4 的 #1–#5 五个端点（注册 / 登录 / `GET,PUT /api/auth/me` / 改密码）、
+  `model.User` + `repo.User`、`internal/auth`（Provider 接缝 + bcrypt 密码策略 +
+  HS256 TokenSigner）、`middleware.JWT`（每请求回库读 role/status，封号即时生效）。
+  验收实测：路由 6 条；纯单测（不连库）auth 59 + middleware 15 + router 7 +
+  service 49 = 130 项全绿；集成测试 66 项全绿（含 M0 的 18 项）；
+  `scripts/smoke.sh` **60 项全绿、0 跳过**，打的是真 dev server + 真开发库。
+  判据链逐条走通：注册 → 登录 → 带 token 访问
+  `/api/auth/me` → 错 token 得 `UNAUTHORIZED` → 重名得 `USER_ALREADY_EXISTS`
+  → 弱密码得 `WEAK_PASSWORD` → banned 用户登录得 `USER_BANNED`；
+  `fakeProvider` 注入单测证明「JWT 签发与 Provider 无关」。
+  另外实测了两条安全性质：账号枚举的**计时**侧信道已抹平（用户名不存在 48.0ms
+  vs 密码错 48.0ms，靠 dummy bcrypt 比对补齐），**响应与日志**两条路径也同形
+  （同 code、同 message、访问日志里同样不带 `err` 字段）。
+- **未开工**：M2 字典·物品·上传 · M3 匹配 · M4 解锁·通知·举报 ·
   M5 归还确认·积分 · M6 治理与管理后台 · M7 前端 · M8 杭电助手 SSO（外部阻塞中）
 
 路由清单见 `internal/router/router.go` —— 那是 §4 全部 50 条路由的唯一注册点，
@@ -277,6 +291,28 @@ go env -w GOPROXY=https://goproxy.cn,direct
 **scoop 装完东西，当前终端里找不到命令。** scoop 改的是**用户环境变量**，
 只对「安装之后新开的终端」生效。装完 `postgresql` 却发现没有 `pg_ctl`，
 关掉终端重开一个就行，不用怀疑安装失败。
+
+**Git Bash 里用 curl 发中文，服务端收到的是问号。** 这条坑长得很像后端编码坏了，
+所以值得单写一段。现象：
+
+```bash
+curl -X POST .../api/auth/register -d '{"nickname":"冒烟"}'   # 库里存成了 "??"
+```
+
+原因不在后端，也不在 curl，而在 **Git Bash 把参数交给 Windows 原生 exe 的那一刻**：
+argv 要按当前代码页转换一次，本机是 `cp1252`，汉字不在里面，于是每个字变成一个 `?`。
+请求在离开 shell 时就已经烂了。
+
+改成从 stdin 喂给 curl 就没事了 —— 管道里的字节由 bash 直接写，不经过这次转换：
+
+```bash
+printf '%s' '{"nickname":"冒烟"}' | curl -X POST .../api/auth/register --data-binary @-
+```
+
+`scripts/smoke.sh` 里的 `req()` 函数统一走 stdin，就是这个原因。
+以后手写 curl 命令测中文时记得这一点，否则会误判成「后端不支持 UTF-8」。
+顺带一个判据：**响应里的**中文一直是好的（stdout 不做这次转换），
+所以「发出去变问号、收回来正常」这个组合就是 argv 的锅，不是数据库编码的锅。
 
 **Go 版本是 1.26.0，计划 §1.2 写的是 1.25.4。** 这是 `GOTOOLCHAIN=auto` 的正常行为：
 scoop 装的是 go 1.25.4，但依赖里 `golang.org/x/text v0.42.0` 要求 `go >= 1.26.0`，

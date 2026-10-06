@@ -6,6 +6,8 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"lostfound/internal/model"
 )
 
 // 本文件是 §8 响应信封的唯一出口，也是 §9「可 debug 四件套」里 RequestID 的落地点。
@@ -19,6 +21,7 @@ import (
 const (
 	CtxRequestID = "apperr_request_id"
 	CtxUserID    = "apperr_user_id"
+	CtxUser      = "apperr_user"
 	CtxLogger    = "apperr_logger"
 	CtxError     = "apperr_error"
 )
@@ -136,6 +139,32 @@ func UserID(c *gin.Context) int64 {
 		}
 	}
 	return 0
+}
+
+// SetUser 由 JWT 中间件调用，存下这次请求**刚从库里读出来的**那一行 users。
+//
+// 为什么存整行而不只存 id：中间件本来就要查一次库（为了拿到最新的 role 和 status，
+// 好让封号/降权即时生效），查都查了，handler 再查一遍就是纯浪费 ——
+// M6 的 admin 校验要看 role，M2 的「仅发帖人」校验要看 id，都会用到它。
+//
+// 这一行永远是当前请求时刻的最新值，不存在缓存过期问题：每个请求都重新读。
+//
+// 放在 apperr 包不会造成循环导入 —— apperr 在依赖图的最底层，
+// middleware → apperr、model 谁都不 import，方向始终是单向的。
+func SetUser(c *gin.Context, u *model.User) { c.Set(CtxUser, u) }
+
+// User 返回当前登录用户；未登录（或没挂 JWT 中间件）时返回 nil。
+//
+// 返回 nil 而不是 panic，理由和 RequestID/UserID 一样：单元测试里直接调 handler
+// 不挂中间件是常态。调用方拿到 nil 就说明「这个路由本该在 JWT 中间件后面」，
+// 那是路由配置的 bug，不是这里该兜的。
+func User(c *gin.Context) *model.User {
+	if v, ok := c.Get(CtxUser); ok {
+		if u, ok := v.(*model.User); ok {
+			return u
+		}
+	}
+	return nil
 }
 
 // SetLogger 由 RequestID 中间件调用：塞一个已经绑好 request_id 的 logger，

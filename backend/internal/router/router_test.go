@@ -2,6 +2,7 @@ package router
 
 import (
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -15,7 +16,26 @@ import (
 //
 // 到 M6 收尾时这个列表必须恰好有 50 条（§4：49 个 JSON API + 1 个 /uploads 静态路由）。
 var expectedRoutes = []string{
-	"GET /api/health", // #38
+	"GET /api/health",                // #38
+	"POST /api/auth/register",        // #1
+	"POST /api/auth/login",           // #2
+	"GET /api/auth/me",               // #3
+	"PUT /api/auth/me",               // #4
+	"POST /api/auth/change-password", // #5
+}
+
+// testConfig 给 Setup 一份**能通过校验**的最小配置。
+//
+// 不能用 config.Config{} 零值：M1 起 Setup 内部会真的 new 一个 auth.TokenSigner，
+// 而它拒绝空密钥和非正的有效期（这是启动期就该拦住的配置错误，见 jwt.go）。
+// 这里的密钥只存在于测试进程内，不是任何环境的真密钥 —— 但刻意写满 32 字节以上，
+// 免得将来有人复制这一行去当 .env 的模板。
+func testConfig() config.Config {
+	return config.Config{
+		Env:       "test",
+		JWTSecret: "router-test-secret-0123456789abcdef0123456789abcdef",
+		JWTExpire: time.Hour,
+	}
 }
 
 // planComplete 在 M6 收尾时改成 true，TestFinalRouteCount 就开始要求 50 条。
@@ -28,8 +48,13 @@ func TestSetupRegistersExactlyTheExpectedRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	// pool 传 nil 是安全的：本测试只检查路由注册结果，从不真正调用 handler。
-	// 这也是这条测试不需要数据库的原因 —— 它属于 §10 的第①层（纯单元测试）。
-	e := Setup(config.Config{}, nil)
+	// repo.NewUser(nil) 只是把 nil 存进结构体，不建连接；auth.NewLocalProvider
+	// 也只在 Authenticate 时才碰库。这也是这条测试不需要数据库的原因 ——
+	// 它属于 §10 的第①层（纯单元测试）。
+	e, err := Setup(testConfig(), nil)
+	if err != nil {
+		t.Fatalf("Setup 返回了 error：%v", err)
+	}
 
 	want := make(map[string]bool, len(expectedRoutes))
 	for _, r := range expectedRoutes {
@@ -78,5 +103,38 @@ func TestNoPanicOnSetup(t *testing.T) {
 			t.Fatalf("Setup 时 panic 了，极可能是 Gin 路由树冲突（同一层混用静态段和 :id 参数段）：%v", r)
 		}
 	}()
-	Setup(config.Config{}, nil)
+	if _, err := Setup(testConfig(), nil); err != nil {
+		t.Fatalf("Setup 返回了 error：%v", err)
+	}
+}
+
+// TestSetupRejectsBadJWTConfig 锁住「配置错了就在启动时失败」这个行为。
+//
+// 为什么值得单独测：Setup 现在会 new 一个真的 TokenSigner，于是它有了一条
+// 新的失败路径。如果这条路径悄悄退化成「密钥太短也能启动」，
+// 后果不是崩溃而是**任何人都能伪造 admin token** —— 而这类退化不会让
+// 任何一条业务测试变红，因为业务测试用的都是合法密钥。
+func TestSetupRejectsBadJWTConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name string
+		cfg  config.Config
+	}{
+		{"密钥为空（零值 Config）", config.Config{JWTExpire: time.Hour}},
+		{"密钥太短", config.Config{JWTSecret: "abc123", JWTExpire: time.Hour}},
+		{"有效期为 0", config.Config{JWTSecret: testConfig().JWTSecret}},
+		{"有效期为负", config.Config{JWTSecret: testConfig().JWTSecret, JWTExpire: -time.Hour}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e, err := Setup(tc.cfg, nil)
+			if err == nil {
+				t.Fatalf("期望 Setup 报错，但它成功了（engine=%v）", e != nil)
+			}
+			if e != nil {
+				t.Errorf("返回 error 时 engine 应该是 nil，实际不是")
+			}
+		})
+	}
 }
