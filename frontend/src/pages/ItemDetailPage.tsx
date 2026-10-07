@@ -268,6 +268,17 @@ export default function ItemDetailPage() {
             {errorId && <span className="req-id">（请求编号 {errorId}）</span>}
           </p>
         )}
+
+        {/* 解锁名单的入口放在 canAct 那块**外面**，而且只判 found：
+            #22 在帖子被下架之后仍然允许作者读（后端那段注释说那是治理场景里最需要的证据），
+            而 canAct 为了避开 ITEM_CLOSED 把 deleted 排除掉了 —— 两个判据不是一回事。 */}
+        {isOwner && item.item_type === 'found' && (
+          <p className="hint">
+            <Link className="link-btn" to={`/items/${item.id}/unlockers`}>
+              查看谁认领并看过这条联系方式
+            </Link>
+          </p>
+        )}
       </section>
 
       {canAct && (

@@ -5,12 +5,17 @@
 // 于是 isEnvelope 判 false，测试表现出「解包器把成功当成透传」这种很难猜的假象。
 import type {
   CategoryNode,
+  ContactViewEntry,
+  CreditHistory,
+  CreditLogView,
   ItemSummary,
   ItemView,
   LocationNode,
   LoginResult,
   Page,
   RegisterResult,
+  RemovalView,
+  UnlockerView,
   UserView,
 } from '../api/types'
 
@@ -161,4 +166,51 @@ export function sampleLocations(): LocationNode[] {
     },
     { id: 99, name: '其他', level: 1, is_freeform: true, sort_order: 99, children: [] },
   ]
+}
+
+/** #19 里 deleted 那几行挂的 removal。reason 是后端给的那句人话，
+ *  夹具刻意写成「像 admin 会写的话」而不是占位串，好让文案断言不至于断言成「含有一个 x」。 */
+export function sampleRemoval(overrides: Partial<RemovalView> = {}): RemovalView {
+  return {
+    action_id: 4801,
+    reason: '帖子中的联系方式为他人手机号，已泄露隐私',
+    created_at: '2026-10-07T02:00:00Z',
+    ...overrides,
+  }
+}
+
+/** #22 名单里的「一个人」。real_name 默认**有值**：
+ *  这一列是全项目唯一出现在对外响应里的真实姓名，漏测它的那条分支（空串时不该显示括号）最没底。 */
+export function sampleUnlocker(overrides: Partial<UnlockerView> = {}): UnlockerView {
+  return { id: 12, nickname: '小李', real_name: '李雷', ...overrides }
+}
+
+export function sampleContactEntry(
+  user: Partial<UnlockerView> = {},
+  overrides: Partial<Omit<ContactViewEntry, 'user'>> = {},
+): ContactViewEntry {
+  return { id: 37, user: sampleUnlocker(user), created_at: '2026-10-07T01:30:00Z', ...overrides }
+}
+
+/** #33 流水的一条。默认是加分那条，扣分在测试里显式写出来更好读。 */
+export function sampleCreditLog(overrides: Partial<CreditLogView> = {}): CreditLogView {
+  return {
+    id: 61,
+    delta: 2,
+    reason: '归还确认通过',
+    ref_type: 'item_return',
+    ref_id: 9,
+    created_at: '2026-10-07T03:00:00Z',
+    ...overrides,
+  }
+}
+
+/** #33 的整个响应。⚠ 不是 Page[T]：credit_score 是现读的当前分，和 list 加起来没有等式关系，
+ *  所以夹具默认给一个**对不上流水总和**的数（+2 的流水配 105 分），
+ *  这样任何「合计」式文案都会在这一页上被自己的断言抓住。 */
+export function sampleCreditHistory(
+  list: CreditLogView[] = [sampleCreditLog()],
+  overrides: Partial<Omit<CreditHistory, 'list'>> = {},
+): CreditHistory {
+  return { credit_score: 105, list, total: list.length, page: 1, page_size: 20, ...overrides }
 }

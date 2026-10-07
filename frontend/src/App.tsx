@@ -1,6 +1,6 @@
 // src/App.tsx —— 页面外壳 + 路由表。
 //
-// 路由表就是里程碑的进度表： '/'、'/login'、'/register'、'/me' 已经通，
+// 路由表就是里程碑的进度表：广场、详情、发帖改帖删帖、「我的」那一族四页已经通，
 // 后面每一片往里加，没做的不放链接（放着就是死链）。
 import { Link, Route, Routes } from 'react-router-dom'
 import { RequireAuth } from './auth/RequireAuth'
@@ -12,6 +12,10 @@ import PostFormPage from './pages/PostFormPage'
 import PostResultPage from './pages/PostResultPage'
 import RegisterPage from './pages/RegisterPage'
 import ItemDetailPage from './pages/ItemDetailPage'
+import MyPostsPage from './pages/MyPostsPage'
+import ContactViewsPage from './pages/ContactViewsPage'
+import CreditLogsPage from './pages/CreditLogsPage'
+import SettingsPage from './pages/SettingsPage'
 
 export default function App() {
   const { status, user, logout } = useAuth()
@@ -74,11 +78,46 @@ export default function App() {
           />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
+          {/* 「我的」那一族四页全要登录：#19 #33 的收件人来自 JWT，#4 #5 改的是凭据本身。
+              /items/:id/unlockers 也在这里 —— 名单里是别人的真实姓名，
+              后端 #22 的鉴权列写的就是「发帖人本人或 admin」，匿名连请求都不该发出去。 */}
           <Route
             path="/me"
             element={
               <RequireAuth>
                 <MePage />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/me/posts"
+            element={
+              <RequireAuth>
+                <MyPostsPage />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/me/credit"
+            element={
+              <RequireAuth>
+                <CreditLogsPage />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/me/settings"
+            element={
+              <RequireAuth>
+                <SettingsPage />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/items/:id/unlockers"
+            element={
+              <RequireAuth>
+                <ContactViewsPage />
               </RequireAuth>
             }
           />

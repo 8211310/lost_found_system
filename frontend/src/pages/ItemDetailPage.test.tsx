@@ -461,4 +461,43 @@ describe('作者操作（#16 入口 / #18 开关 / #17 软删）', () => {
     expect(screen.queryByText('这条是你发的')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /已归还|重新开放/ })).not.toBeInTheDocument()
   })
+
+  it('但「谁看过联系方式」的入口在架不架都给：#22 读的是记录，不是操作权限', async () => {
+    setToken('jwt.xiaowang')
+    mockMe(sampleUser({ id: 8 }))
+    mockDetail(mine())
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('捡到黑色长款钱包')
+    expect(screen.getByRole('link', { name: '查看谁认领并看过这条联系方式' })).toHaveAttribute(
+      'href',
+      '/items/202/unlockers',
+    )
+  })
+
+  it('被下架之后这个入口依然在：后端说那是治理场景里最需要的证据', async () => {
+    setToken('jwt.xiaowang')
+    mockMe(sampleUser({ id: 8 }))
+    // 上面那条测试刚证明「操作栏整块消失」，这一条证明同一屏上**读**的入口没跟着消失。
+    // 后端 #22 的注释写得很直接：作者被下架之后仍然有权知道在被下架之前谁来看过。
+    mockDetail(mine({ status: 'deleted' }))
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('捡到黑色长款钱包')
+    expect(screen.queryByText('这条是你发的')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '查看谁认领并看过这条联系方式' })).toBeInTheDocument()
+  })
+
+  it('失物帖没有这个入口：#21 对 lost 返回 VALIDATION，那种帖的名单永远是空的', async () => {
+    setToken('jwt.xiaowang')
+    mockMe(sampleUser({ id: 8 }))
+    mockDetail(mine({ item_type: 'lost', contact: '微信 bbb' }))
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('捡到黑色长款钱包')
+    expect(screen.queryByRole('link', { name: '查看谁认领并看过这条联系方式' })).not.toBeInTheDocument()
+  })
 })

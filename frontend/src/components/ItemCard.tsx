@@ -4,6 +4,11 @@
 // 这不是偷懒：计划 §4 把摘要和详情分成两个形状，就是为了让列表页不去干详情页的活
 // （model.ItemSummary 的注释里写了这条理由）。在卡片里偷偷多发一次 #15，
 // 一个 20 行的列表就是 20 次额外请求，而且契约测试抓不到 —— 它测的是响应形状，不是请求次数。
+//
+// footer 是给「摘要之外还要挂东西」的页面留的（我的发布挂编辑入口和下架原因），
+// 它渲染在卡片链接**外面**：嵌套 <a> 是非法 HTML，浏览器解析时会自行拆开，
+// 拆出来的形状取决于解析器而不是写代码的人 —— 那种事不该靠测试去发现。
+import { type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { localMinute } from '../lib/time'
 import type { ItemSummary } from '../api/types'
@@ -17,8 +22,19 @@ function timeLine(item: ItemSummary): string {
   return `${item.item_type === 'lost' ? '丢失于' : '拾获于'} ${localMinute(iso)}`
 }
 
-export default function ItemCard({ item }: { item: ItemSummary }) {
+/** deleted 的标签为什么写得这么含糊：#19 里 status=deleted 的行有两种来历 ——
+ *  作者自己 #17 软删的，和 admin 下架的。后者才带 removal，那种行由页面上专门一块
+ *  「为什么不见了」说明原因；这里这一枚标签只负责把「它不在广场上了」说清楚，
+ *  不许在两种来历之间替用户下判断。 */
+function statusTag(item: ItemSummary): string {
+  if (item.status === 'closed') return '已归还'
+  if (item.status === 'deleted') return item.removal ? '已被下架' : '已关闭'
+  return ''
+}
+
+export default function ItemCard({ item, footer }: { item: ItemSummary; footer?: ReactNode }) {
   const time = timeLine(item)
+  const tag = statusTag(item)
 
   return (
     <li className="item-card">
@@ -34,7 +50,7 @@ export default function ItemCard({ item }: { item: ItemSummary }) {
         <span className="item-body">
           <span className="item-tags">
             <span className={`tag tag-${item.item_type}`}>{item.item_type === 'lost' ? '失物' : '拾物'}</span>
-            {item.status === 'closed' && <span className="tag tag-closed">已归还</span>}
+            {tag && <span className={`tag tag-${item.status}`}>{tag}</span>}
           </span>
 
           <span className="item-title">{item.title}</span>
@@ -52,6 +68,8 @@ export default function ItemCard({ item }: { item: ItemSummary }) {
           {item.contact && <span className="item-contact">联系：{item.contact}</span>}
         </span>
       </Link>
+
+      {footer}
     </li>
   )
 }

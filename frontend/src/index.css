@@ -691,3 +691,120 @@ select:focus {
   border-color: var(--danger);
   color: #fff;
 }
+
+/* ---- 片 4「我的」那一族 ---- */
+
+.me-entries h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  color: var(--fg-muted);
+}
+
+.entry-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.entry-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.entry-list a {
+  color: var(--primary-dark);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+/* 我的发布里一张卡片下面挂的那些文字按钮。
+   它们必须是卡片的**兄弟**而不是套在封面那条链接里面（嵌套 <a> 会被浏览器拆开），
+   所以这里靠 gap + 上边框把它们和摘要分开，而不是再画一个盒子。 */
+.item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 0 0 12px;
+}
+
+/* 下架原因：这块的底色用 danger 那一族但强度压低 ——
+   它是「解释」，不是「你犯了错」；举报和下架都不是裁决。 */
+.removal-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--danger);
+  background: var(--danger-bg);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.removal-box strong {
+  color: var(--danger);
+}
+
+/* 解锁名单 / 积分流水这类「一条一件事」的日志表。
+   三列在窄屏上换行而不是压成一堆：手机上时间那一段掉到第二行比挤成 8px 好读。 */
+.log-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+
+.log-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.log-who {
+  font-weight: 600;
+}
+
+.log-reason {
+  flex: 1;
+  min-width: 0;
+}
+
+.log-time {
+  color: var(--fg-muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.log-delta {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  min-width: 3ch;
+}
+
+.log-delta-plus {
+  color: #147a3d;
+}
+
+.log-delta-minus {
+  color: var(--danger);
+}
+
+/* 当前分单独一块：它是「现在是多少」，和下面那张「怎么来的」的表不是一回事，
+   视觉上分开是为了让人不去把它们加在一起。 */
+.credit-now {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  background: var(--bg);
+  border-radius: var(--radius);
+  font-size: 14px;
+}
+
+.credit-now strong {
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+}

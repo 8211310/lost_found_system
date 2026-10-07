@@ -9,6 +9,7 @@
 // 每条都写清鉴权，因为前端必须知道「匿名能不能读」：#14 #15 公开，其余全要登录。
 import { deleteJSON, getJSON, patchJSON, postJSON, putJSON } from './client'
 import type {
+  ContactViewEntry,
   CreateItemPayload,
   CreateItemResult,
   ItemSummary,
@@ -39,8 +40,10 @@ export interface ItemListQuery {
 
 /** buildQuery 把 undefined、null 和空串统一滤掉。
  *  axios 只跳 undefined，空串会被序列化成 `&keyword=`；后端能吃，但 URL 里挂一堆空参数
- *  会让「这条链接分享出去是什么筛选状态」变得没法一眼看出来，而广场的 URL 是可直接分享的。 */
-function buildQuery(q: ItemListQuery): Record<string, string | number> {
+ *  会让「这条链接分享出去是什么筛选状态」变得没法一眼看出来，而广场的 URL 是可直接分享的。
+ *  导出来给 my.ts 用：#19 和 #14 走的是后端同一个 listQueryFrom，参数清洗必须同一份代码，
+ *  两边各写一遍就会有一边漏掉空串。 */
+export function buildQuery(q: object): Record<string, string | number> {
   const out: Record<string, string | number> = {}
   for (const [k, v] of Object.entries(q)) {
     if (v === undefined || v === null || v === '') continue
@@ -116,4 +119,23 @@ export function changeItemStatus(id: number | string, status: 'open' | 'closed')
  *  所以调用它的地方（编辑页）要在点下去之前就说清这一点，而不是等用户回去才发现图没了。 */
 export function deleteItemImage(id: number): Promise<null> {
   return deleteJSON<null>(`/api/item-images/${id}`)
+}
+
+/** #22 GET /api/items/:id/contact-views（JWT，**发帖人 + admin**）—— 谁解锁过我的联系方式。
+ *
+ * 这一页存在的理由是定位原则 3：解锁**不是**认领，任何人都能来看、能来联系，
+ * 所以平台能给发帖人的不是「锁」而是一份事后证据 —— contact_views 那行就是它。
+ * 后端那条判据在 service/contact.go（`actor.ID != d.UserID && !actor.IsAdmin()` → FORBIDDEN），
+ * 所以调用方必须先用 #15 的 author.id 判过身份，不该让普通访客点进一个必然 403 的地址。
+ *
+ * ⚠ 这是**读**操作，不写任何东西：读十次不会多出十行解锁记录（那是 #21 干的）。 */
+export function getContactViews(
+  id: number | string,
+  page?: number,
+  pageSize?: number,
+): Promise<Page<ContactViewEntry>> {
+  return getJSON<Page<ContactViewEntry>>(
+    `/api/items/${id}/contact-views`,
+    buildQuery({ page, page_size: pageSize }),
+  )
 }

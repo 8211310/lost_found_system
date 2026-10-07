@@ -105,6 +105,20 @@ export interface ImageView {
   sort_order: number
 }
 
+/** model.RemovalView —— 「这条帖子为什么不见了」里**能给作者看**的那部分。
+ *
+ * 它不是 items 表上的列，是读的时候从 admin_actions 那本登记簿现查的（所以只有 #19
+ * 和作者本人的 #15 会填，#14 广场永远不带）。三个键之外后端刻意不放三样东西：
+ * **操作者的身份**（把具体的人暴露给被处置者，治理纠纷就变成私人恩怨）、
+ * **举报条数**（会被拿去猜是谁举报的）、**举报人是谁**（举报对被举报者匿名是前提）。
+ * 所以前端在这里连「是谁下架的」都无从显示 —— 那不是漏做，是那条禁令。
+ * action_id 是给作者报修用的编号，页面上要原样给出来。 */
+export interface RemovalView {
+  action_id: number
+  reason: string
+  created_at: string
+}
+
 /** #6 POST /api/uploads 的 data —— 也是发帖时 image_paths 里该放的东西。
  *
  * ⚠ 提交给 #13/#16 的是 **path**，不是 url。后端 service.IsUploadPath 只对 path 那种
@@ -185,6 +199,9 @@ export interface ItemView {
   author: AuthorView
   created_at: string
   updated_at: string
+  /** 同 ItemSummary.removal：后端 omitempty，只有**作者本人**读到已下架的帖子时才有。
+   *  外人读同一条拿到的是 NOT_FOUND，所以详情页不需要考虑「别人看到这块」。 */
+  removal?: RemovalView
 }
 
 /** model.ItemSummary —— #14 广场、#19 我的发布、#20 匹配结果、#24/#28/#29 共用的摘要形状。
@@ -206,6 +223,10 @@ export interface ItemSummary {
   author_id: number
   author_name: string
   created_at: string
+  /** 只有 #19 我的发布在 status=deleted 的那几行上出现（后端 omitempty）。
+   *  判据是「这条已经被下架了，作者有权知道为什么」，不是「列表刚好顺手带了」——
+   *  所以广场（#14）的筛选白名单里压根没有 deleted，那个响应永远不带这个键。 */
+  removal?: RemovalView
 }
 
 /** matcher.CategorySignal —— #20 breakdown 里的分类那一路。
@@ -309,3 +330,49 @@ export const REPORT_REASONS = [
 ] as const
 
 export type ReportReasonCode = (typeof REPORT_REASONS)[number]['value']
+
+/** model.UnlockerView —— #22 名单里「一个人」的形状。
+ *
+ * ⚠ `real_name` 是**全项目唯一**出现在对外响应里的地方，就这一份，而且读者被限死成
+ * 发帖人和 admin（`contact.go` 那句 `actor.ID != d.UserID && !actor.IsAdmin()` 就挡这个）。
+ * AuthorView 刻意没有它，因为 #15 是公开接口；这里能带是因为「谁解锁过我的联系方式」
+ * 本来就是「你确实需要知道对方是谁」的场合。前端不许把它抄到别的地方去显示。 */
+export interface UnlockerView {
+  id: number
+  nickname: string
+  real_name: string
+}
+
+/** #22 GET /api/items/:id/contact-views 的 list 元素。
+ *  外层 id 是 contact_views 的行 id，不是用户 id —— 留着是为了让这份名单可引用
+ *  （「第 37 行那次」比「第三个人」精确），不是为了跳转。 */
+export interface ContactViewEntry {
+  id: number
+  user: UnlockerView
+  created_at: string
+}
+
+/** model.CreditLogView —— #33 流水里的一条。
+ *  ref_type / ref_id 是 `string | null` / `number | null`：早期流水可以在没有任何
+ *  对应业务行的情况下被写进来（admin 手工调分那种），所以这两列在库里可空，
+ *  前端不许假设「有 delta 就一定点得开一条归还记录」。 */
+export interface CreditLogView {
+  id: number
+  delta: number
+  reason: string
+  ref_type: string | null
+  ref_id: number | null
+  created_at: string
+}
+
+/** #33 GET /api/my/credit-logs 的 data —— ⚠ **不是** Page[T]：它在分页四键之外多带一个
+ *  credit_score（后端直接从 JWT 用户上取，不是从流水累加出来的）。
+ *  所以「当前分数」和「流水加起来的总和」是两件事，页面上不许写成「以下合计 X 分」——
+ *  真有历史归档或对账差额时那句话就会和数字打架。 */
+export interface CreditHistory {
+  credit_score: number
+  list: CreditLogView[]
+  total: number
+  page: number
+  page_size: number
+}

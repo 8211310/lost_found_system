@@ -1,16 +1,23 @@
-// src/pages/MePage.tsx —— 片 1 的受保护页，同时是守卫的验收点。
+// src/pages/MePage.tsx —— 「我的」首页：身份来自 #3，四条入口，一个退出。
 //
-// 「我的」真正的内容（发布 / 归还确认 / 通知 / 积分）在片 4 做，这一版只显示 #3
-// GET /api/auth/me 已经返回的字段 + 退出登录。之所以现在就要有这么一页：
-// RequireAuth 需要一个真实的落点，否则「刷新不掉登录态」这条判据没法在浏览器里看。
-import { useNavigate } from 'react-router-dom'
+// 这一页自己不请求任何东西。这不是省一次调用，而是**身份只有一个来源**：
+// 顶栏和这里都读 AuthContext 里那份由 #3 填进来的 user，所以两处的 role / credit_score
+// 一定同时变、也一定和后端一致（后端每个请求都重读库，封号和降权即时生效）。
+// 这里再发一次 #3，就会有两个可能不同步的「我是谁」。
+//
+// 入口只放已经存在的页面：计划 §M7 的纪律是「没做的不放链接，放着就是死链」，
+// 所以通知中心（#30–#32）要到片 5 和归还确认流一起上线时才出现在这里。
+import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
+import { localMinute } from '../lib/time'
 
 export default function MePage() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
 
-  if (!user) return null
+  // 匿名到不了这一页（RequireAuth 挡着），但 #3 还没回来的那几百毫秒 user 也是空的：
+  // 守卫在那段时间原地等待而不是闪一下登录页，所以等待的样子也得在这里给出来。
+  if (!user) return <p className="muted">正在确认身份…</p>
 
   function onLogout() {
     logout()
@@ -18,25 +25,50 @@ export default function MePage() {
   }
 
   return (
-    <section className="card">
-      <h1>我的</h1>
+    <>
+      <section className="card">
+        <h1>{user.nickname}</h1>
 
-      <dl className="kv">
-        <dt>昵称</dt>
-        <dd>{user.nickname}</dd>
-        <dt>用户名</dt>
-        <dd>{user.username}</dd>
-        <dt>身份来源</dt>
-        <dd>{user.auth_source === 'local' ? '本地账号密码' : user.auth_source}</dd>
-        <dt>信用分</dt>
-        <dd>{user.credit_score}</dd>
-        <dt>注册时间</dt>
-        <dd>{user.created_at}</dd>
-      </dl>
+        <dl className="kv">
+          <dt>用户名</dt>
+          <dd>{user.username}</dd>
+          <dt>身份来源</dt>
+          <dd>{user.auth_source === 'local' ? '本地账号密码' : '杭电助手'}</dd>
+          <dt>当前信用分</dt>
+          <dd>{user.credit_score}</dd>
+          <dt>注册时间</dt>
+          <dd>{localMinute(user.created_at)}</dd>
+        </dl>
 
-      <button className="btn" type="button" onClick={onLogout}>
-        退出登录
-      </button>
-    </section>
+        {user.role === 'admin' && (
+          <p className="hint">
+            这个账号是管理员，但管理后台还没做，所以这里只有普通用户的那几项 ——
+            没有入口不等于没有权限，权限本身是后端在每个请求上现读的。
+          </p>
+        )}
+
+        <button className="btn" type="button" onClick={onLogout}>
+          退出登录
+        </button>
+      </section>
+
+      <nav className="card me-entries" aria-label="我的那一族">
+        <h2>我的</h2>
+        <ul className="entry-list">
+          <li>
+            <Link to="/me/posts">我的发布</Link>
+            <span className="muted">包括已归还的、已下架的，以及「为什么不见了」那句话。</span>
+          </li>
+          <li>
+            <Link to="/me/credit">积分流水</Link>
+            <span className="muted">当前分数和它的来龙去脉，一条一分记着。</span>
+          </li>
+          <li>
+            <Link to="/me/settings">账号设置</Link>
+            <span className="muted">改昵称、留联系方式，本地账号还能改密码。</span>
+          </li>
+        </ul>
+      </nav>
+    </>
   )
 }
