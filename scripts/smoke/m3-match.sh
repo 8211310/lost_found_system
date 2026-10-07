@@ -19,12 +19,15 @@ LOC_OTHER=3     # 「其他」：level 1 叶子、is_freeform=true、parent_id N
 
 # 三个时刻都相对 now（UTC），这样「found_at 落在丢失窗口里 → S_time=1.0」
 # 是这条链自己保证的，不依赖跑脚本的那一天：
-#   last_seen 3 小时前 → found 90 分钟前 → lost_at 2 小时前
+#   last_seen 3 小时前 → found 150 分钟前 → lost_at 2 小时前
 # 注意顺序：lost_at 必须**晚于** last_seen_at（M2 那条时间校验会拒反的），
 # 而 found_at 夹在中间，才是 §5.3 说的「在你意识到丢之前就被捡到了」。
+# ⚠ 夹在中间这一点是判据① 那条 in_loss_window 断言在守的东西。found_at 一旦挪出
+#   [last_seen_at, lost_at]，S_time 就从 1.0 掉进衰减档（每过一小时扣 1/336），
+#   而这一节其它判据全都不会因此变红 —— 0.99 和 1.0 一样轻松跨过 0.75 的通知线。
 T_SEEN="$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)"
 T_LOST="$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)"
-T_FOUND="$(date -u -d '-90 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+T_FOUND="$(date -u -d '-150 minutes' +%Y-%m-%dT%H:%M:%SZ)"
 
 pairs_before="$(db 'SELECT count(*) FROM match_pairs')"
 notif_me_before="$(db "SELECT count(*) FROM notifications WHERE user_id=$MY_ID AND type='new_match'")"
@@ -62,8 +65,13 @@ req GET "/api/items/$M3_LOST_ID/matches" '' "$TOKEN"
 check '① 本人查匹配返回 HTTP 200'   '200'          "$STATUS"
 check '  code 是 OK'                '"code":"OK"' "$BODY"
 check "  ① 本轮那条 found 帖出现在列表里（id=$M3_FOUND_ID）" "\"id\":$M3_FOUND_ID," "$BODY"
-check '  ① tier 是 1（同地点 + 时间在窗口内，严格模式的前提成立）' '"tier":1' "$BODY"
+check '  ① tier 是 1（地点不是 freeform「其他」+ 目标自己有 last_seen_at，这才是 CanTier1 的两个前提）' '"tier":1' "$BODY"
 check '  ① 每个信号都带 weight 和 score（前端要按它渲染分解表）' '"category":{"weight":' "$BODY"
+# §5.3 的最佳档（found_at 夹在 last_seen_at 和 lost_at 之间 → S_time=1.0）必须由这条钉住。
+# 在它之前，这一节对时间信号**一条断言都没有**：found_at 挪出窗口只会让分数从 1.0 变成 0.9985，
+# 跨线判据照过、形状判据照绿，最后只有 :20 那段注释在替它说谎。
+# 注意「时间落在窗口内」不是 tier=1 的前提（那是地点和有无可比叶子的事），别把它写进上面那条标题。
+check '  ① 时间这一路落在丢失窗口内（in_loss_window=true，也就是 S_time=1.0 那一档）' '"in_loss_window":true' "$BODY"
 if [[ "$BODY" == *'"attr"'* ]]; then
   printf '  %sFAIL%s breakdown 里有 attr —— S_attr 已经随 color/brand 两列一起删掉了（§5.4）\n' "$RED" "$RESET"; fail=$((fail+1))
 else
