@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"lostfound/internal/apperr"
@@ -20,22 +21,29 @@ import (
 //	④建 lost 帖 → 响应带 **matches_preview 数组**、**match_pairs 与 notifications 都 0 行**
 //	⑤地点「其他」的 lost → **tier:2 + 四个信号 + notice 文案 + 同样不产生通知**
 //
-// 再加 #20 的鉴权（401 / 403 / admin）和参数校验。
+// 再加 #20 的鉴权（401 / 403 / admin）、参数校验，和 #16 改帖重匹配。
 //
-// ---------- 关于判据③的一个必须说清楚的偏差 ----------
+// ---------- 关于判据③的一处偏差和它的修法（2026-10-07，已与用户确认）----------
 //
 // match_pairs 的唯一约束是 `UNIQUE(lost_item_id, found_item_id)`，也就是**一对帖子**一条。
-// 而 found 帖每次创建都会拿到一个新的 item id，所以通过 HTTP 走两遍发帖流程
-// **永远造不出冲突** —— 第二次是一条新事实（另一个人也捡到了类似的东西），
-// 该发第二条通知。§3.7 原文的主语正是「这一对」，所以这么实现是对的。
+// 而 found 帖每次创建都会拿到一个新的 item id，所以判据③那句「重复建同样的 found 帖 →
+// 仍一行」**按字面实现是错的**：走 HTTP 两遍发帖永远造不出冲突，第二次是一条新事实
+// （另一个人也捡到了类似的东西），该发第二条通知 —— 和定位原则③「认领非排他」同一个逻辑。
 //
-// 所以去重被拆成两条测试，各自测自己那一半：
-//   - TestSameLostMatchedByTwoFoundPosts：同一 lost 被两条不同的 found 命中 → 2 行、2 条通知
-//     （这才是「重复建同样的 found 帖」在真实数据下的样子。判据里那句「仍一行」按字面实现，
-//     等于要求「一个人被同一个物品通知过一次就永远不再通知」，那是错的）
-//   - TestLedgerOnConflictDedup：直接对同一个 (lost, found) 调两次写入 → 第二次 0 条、
-//     表里仍一行、notifications 仍一行。这才是 ON CONFLICT 那条去重机制本身。
-//     它是**唯一**能让真数据库跑到那条 SQL 的路径，所以这里用 repo 层直连而不是 HTTP。
+// 冲突真正发生在**同一对第二次参与匹配**的时候，而唯一能触发它的动作是改帖
+// （§3.7 用途① 举的例子本来就是「同一条 found 帖被编辑后重新触发匹配」）。
+// 问题是 §5.8 的触发源表里根本没有「编辑」这一行，代码里 Update() 也确实没跑匹配 ——
+// 计划自己前后不一致，于是那条 SQL 无处可达，同时还留下一个功能洞：
+// 小王把「捡到钱包/其他」改成「黑色长款钱包/图书馆」之后，系统不会重算，
+// 小李永远等不到那条通知。
+//
+// 所以判据③最后由三条测试分担，一条比一条更接近它想守的东西：
+//   - TestEditFoundPostRematchesAndDedups：**改帖 → 再改帖**，同一对第二次插入被 ON CONFLICT
+//     挡掉，台账和通知都不增行。这是判据③真正可执行的形式，而且是走 HTTP 的。
+//   - TestLedgerOnConflictDedup：直接对同一个 (lost, found) 调两次写入，验那条 SQL 本身
+//     （含混合批次：旧对跳过、新对照发）。
+//   - TestSameLostMatchedByTwoFoundPosts：同一 lost 被两条不同的 found 命中 → 2 行、2 条通知。
+//     这条是把「不去重才是对的」那半边钉住，防止有人把去重键改成 lost_item_id。
 
 // ---------- 字典里的已知行（复用 m2_items_test.go 的那几个常量）----------
 //
@@ -483,15 +491,141 @@ func TestSameLostMatchedByTwoFoundPosts(t *testing.T) {
 	// 「同一个人被第二个拾主通知」会被吞掉，那是真丢东西的人最不该错过的信息。
 }
 
+// TestEditFoundPostRematchesAndDedups 是判据③现在**真正可达**的那条路径：改帖。
+//
+// 判据原文写的是「重复建同样的 found 帖 → ON CONFLICT 生效」，但走 HTTP 发帖永远拿不到
+// 同一个 found_item_id，所以那条 SQL 在发帖路径上不可达（见文件顶部）。
+// 真正会让「同一对帖子第二次参与匹配」的动作是**改帖**：§3.7 用途① 举的例子
+// 本来就是「同一条 found 帖被编辑后重新触发匹配」。
+//
+// 而且这条路径不只是为了让判据可测，它补的是一个真实的功能洞：
+// 小王随手发了「钱包」、地点选「其他」，没匹配上；后来他把描述改准了。
+// 没有这一步的话系统不会重算，小李永远等不到通知 —— 只能天天自己刷广场。
+//
+// 五步链，每步的台账/通知增量都是精确值而不是「≥」：
+//
+//	① 弱文本 found 帖（0.70，在展示区、通知线以下）→ 台账 0、通知 0
+//	② 改成强文本（0.88）                                  → 台账 +1、小李 +1 条、小王 +0 条
+//	③ 再改一次（同一对第二次插入 → ON CONFLICT）          → 台账 +0、通知 +0  ← 判据③
+//	④ 改的是 lost 帖（不对称在改帖上同样成立）            → 台账 +0、通知 +0
+//	⑤ 关掉那条 found 帖再改（closed 不该打扰已结束寻找的人）→ 台账 +0、通知 +0
+func TestEditFoundPostRematchesAndDedups(t *testing.T) {
+	harness.TruncateAll(t)
+
+	const password = "correct-horse-battery"
+	li := harness.RegisterAndLogin(t, "li4", password)
+	xw := harness.RegisterAndLogin(t, "wang4", password)
+
+	lost := createItem(t, li, lostWalletBody(walletTitleLost, walletDesc, locLibrary, detailLibrary))
+
+	ledger := func() int {
+		return harness.Count(t, `SELECT count(*) FROM match_pairs WHERE lost_item_id = $1`, lost.ID)
+	}
+	liNotices := func() int {
+		return harness.Count(t, `SELECT count(*) FROM notifications WHERE user_id = $1`, li.UserID)
+	}
+	xwNotices := func() int {
+		return harness.Count(t, `SELECT count(*) FROM notifications WHERE user_id = $1`, xw.UserID)
+	}
+
+	// ① 「钱包」+ 空描述：0.45（同小类）+ 0.40×0.25（标题 dice=0.5、描述 0，各占一半）
+	//    + 0.15（拾获时间落在丢失窗口）= 0.70。
+	//    高于展示线 0.55（小李在 #20 里看得见它）、低于通知线 0.75（不该发通知）。
+	//    这一步的作用是让 ② 有一个「从 0 变成 1」的对照 —— 一开始就满分的话，
+	//    「改帖触发了一次写入」和「写入其实是发帖时留下的」分不出来。
+	sloppy := createItem(t, xw, foundWalletBody("钱包", "", locLibrary, detailLibrary))
+	if n := ledger(); n != 0 {
+		t.Fatalf("① 0.70 低于通知线，不该写台账，实际 %d 行", n)
+	}
+	assertCount(t, "notifications", 0)
+
+	// ② 改准了 → 同一个 found_item_id 第一次真正够线。
+	rPut := harness.Do(t, http.MethodPut, "/api/items/"+itoa(sloppy.ID),
+		foundWalletBody(walletTitleFound, walletDesc, locLibrary, detailLibrary), xw.Token)
+	RequireOK(t, rPut, "② 小王把拾物帖改准")
+	if n := ledger(); n != 1 {
+		t.Errorf("② 改帖后应该写一行台账，实际 %d 行", n)
+	}
+	if n := liNotices(); n != 1 {
+		t.Errorf("② 小李应该因为这次改帖收到 1 条 new_match，实际 %d 条", n)
+	}
+	if n := xwNotices(); n != 0 {
+		t.Errorf("② 小王是拾物方，平台不通知 found 作者任何东西，实际收到 %d 条", n)
+	}
+	// 通知正文用的是**改过之后**的标题。这一条顺带证明了匹配读的是更新后的行
+	// 而不是请求体里那份半成品 —— 如果 OnUpdated 拿的是改之前的数据，
+	// 分数根本够不到 0.75，台账也不会有行，但日志文案错这件事只有查内容才会发现。
+	nItemID, _, nContent := onlyNotification(t)
+	if nItemID != sloppy.ID {
+		t.Errorf("② 通知挂的 item 应该是那条 found 帖 %d，实际 %d", sloppy.ID, nItemID)
+	}
+	if !strings.Contains(nContent, walletTitleFound) {
+		t.Errorf("② 通知正文里应该是改后的标题「%s」，实际：%s", walletTitleFound, truncate(nContent))
+	}
+
+	// #16 的响应形状没变：匹配结果不进改帖响应（想看得用 #20）。
+	// 这条断言防的是「顺手把 notified_count 塞进所有写接口」——那会让 #16 的契约
+	// 随帖子类型变化，而前端表单是同一个。
+	if _, ok := dataKeys(t, rPut)["notified_count"]; ok {
+		t.Errorf("② 改帖响应里出现了 notified_count，#16 的契约不该带它：%s", truncate(string(rPut.Data)))
+	}
+
+	// ③ **判据③本体**：同一对第二次参与匹配。
+	//    只把 location_detail 动一下（够让 UPDATE 真的执行、updated_at 变掉），
+	//    分数仍然是 0.88，仍然 ≥ 通知线，于是 RecordMatches 又被调用一次 ——
+	//    这次 ON CONFLICT 吃掉它，台账不增行、通知不发。
+	//    没有这条约束的话，小王每改一次帖子（改错别字、换电话）都会把小李通知一遍。
+	twice := foundWalletBody(walletTitleFound, walletDesc, locLibrary, "三楼自习室C区")
+	RequireOK(t, harness.Do(t, http.MethodPut, "/api/items/"+itoa(sloppy.ID), twice, xw.Token),
+		"③ 第二次改同一条拾物帖")
+	if n := ledger(); n != 1 {
+		t.Errorf("③ 同一对第二次插入应该被 ON CONFLICT 挡掉，台账期望仍 1 行，实际 %d 行", n)
+	}
+	if n := liNotices(); n != 1 {
+		t.Errorf("③ 不该重复通知同一个人，小李的 new_match 期望仍 1 条，实际 %d 条", n)
+	}
+
+	// ④ 改 lost 帖不写台账也不发通知：不对称是「方向」的规则，不是「发帖」的规则。
+	//    这里数的是**全表**而不是 lost.ID 那一行：假如有人在 OnUpdated 里漏了类型判断，
+	//    改一条 lost 帖会拿 found 帖当候选往台账里写，那一行的 lost_item_id 是**候选的 id**，
+	//    按 lost.ID 数出来还是 1，测试照样绿。数全表才挡得住方向写反。
+	RequireOK(t, harness.Do(t, http.MethodPut, "/api/items/"+itoa(lost.ID),
+		lostWalletBody(walletTitleLost, walletDesc+"（还有一把钥匙）", locLibrary, detailLibrary), li.Token),
+		"④ 小李改自己的失物帖")
+	assertCount(t, "match_pairs", 1)
+	assertCount(t, "notifications", 1)
+
+	// ⑤ 东西已经还回来了（closed），之后又冒出第二条相似的失物帖，
+	//    小王这时改他那条 closed 的拾物帖（§8 允许改 closed 帖，比如改错了的电话）。
+	//    ⚠ 这一对是**全新的**，台账里没有：所以这一步真正测的是「closed 不跑匹配」这道门槛。
+	//    如果 OnUpdated 只看类型不看状态，这里会多写一行台账、多给小赵发一条通知 ——
+	//    而那条通知说的是「你丢的东西可能有匹配」，对方捡到并已经归还的东西根本不可能还给他。
+	li2 := harness.RegisterAndLogin(t, "li5", password)
+	late := createItem(t, li2, lostWalletBody(walletTitleLost, walletDesc, locLibrary, detailLibrary))
+	if n := harness.Count(t, `SELECT count(*) FROM match_pairs WHERE lost_item_id = $1`, late.ID); n != 0 {
+		t.Fatalf("⑤ 发 lost 帖不该写台账（不对称），实际 %d 行", n)
+	}
+
+	harness.SetItemStatus(t, sloppy.ID, "closed")
+	RequireOK(t, harness.Do(t, http.MethodPut, "/api/items/"+itoa(sloppy.ID),
+		foundWalletBody(walletTitleFound, walletDesc, locLibrary, "一楼大厅服务台"), xw.Token),
+		"⑤ 改一条 closed 的拾物帖必须成功")
+	assertCount(t, "match_pairs", 1)
+	assertCount(t, "notifications", 1)
+	if n := harness.Count(t, `SELECT count(*) FROM notifications WHERE user_id = $1`, li2.UserID); n != 0 {
+		t.Errorf("⑤ 小赵不该收到任何匹配通知（那条拾物帖已经归还了），实际 %d 条", n)
+	}
+}
+
 // TestLedgerOnConflictDedup 直接在 repo 层验 ON CONFLICT —— 判据③说的「去重」本身。
 //
-// 这是唯一能跑到那条 SQL 的路径：先把一对帖子通过 HTTP 建出来（拿到真实外键 id），
-// 再对同一个 (lost, found) 调两次 RecordMatches。走 HTTP 两次发帖永远造不出冲突，
-// 因为 found_item_id 每次都不同。
+// 和上面那条改帖链的分工：HTTP 那条测的是「业务代码真的会走到这条 SQL」，
+// 这里测的是这条 SQL 本身在真 PostgreSQL 上的行为 —— 第一次 1 行、第二次 0 行、
+// 通知只跟着受影响行数走。$4::jsonb 的转型、score 列的 NUMERIC(5,4)、
+// 以及 notifications 那两条 INSERT 的列名，都是纯单测和 fake store 永远碰不到的东西。
 //
-// 顺带这也是 repo/match.go 那段 SQL 第一次在真库里执行：$4::jsonb 的转型、
-// score 列的 NUMERIC(5,4)、以及 notifications 那两条 INSERT 的列名，
-// 全都是纯单测和 fake store 永远碰不到的东西。
+// 这里还要多测一件 HTTP 测不到的事：**rows 为空时不开事务**（repo 里那条提前 return），
+// 以及「同一批里一半是新对一半是旧对」的混合情况。
 func TestLedgerOnConflictDedup(t *testing.T) {
 	harness.TruncateAll(t)
 
@@ -544,6 +678,32 @@ func TestLedgerOnConflictDedup(t *testing.T) {
 	}
 	if got := harness.Count(t, `SELECT count(*) FROM notifications`); got != 1 {
 		t.Errorf("去重命中时不该多插通知，notifications 期望 1 行，实际 %d", got)
+	}
+
+	// 混合批次：同一批里一条是旧对、一条是新对 → 只发新对那条的通知，返回 1。
+	// 这条测的是 RecordMatches 循环里那个 continue：把「唯一冲突」当成错误往上抛的话，
+	// 一整个帖子的通知会因为其中一条早就记过而全部消失，而发帖人那边已经是 200 了。
+	// 用另一个失主的一条 lost 帖当新对（发 lost 帖自己不写台账，所以行数仍然只涨这一条）。
+	other := createItem(t, li, lostWalletBody("黑色雨伞", "黑色长柄雨伞，伞尖有缺口", locLibrary, detailLibrary))
+	mixed, err := m.RecordMatches(ctx, []repo.LedgerRow{
+		{LostItemID: lost.ID, FoundItemID: found.ID, Score: walletScore,
+			Breakdown: rows[0].Breakdown, NotifyTo: li.UserID,
+			NotifyTitle: "旧对，不该再发", NotifyBody: "不该出现"},
+		{LostItemID: other.ID, FoundItemID: found.ID, Score: walletScore,
+			Breakdown: rows[0].Breakdown, NotifyTo: li.UserID,
+			NotifyTitle: "新对，应该发", NotifyBody: "应该出现"},
+	})
+	if err != nil {
+		t.Fatalf("混合批次写入失败: %v", err)
+	}
+	if mixed != 1 {
+		t.Errorf("混合批次期望只发 1 条通知（旧对那条被 ON CONFLICT 挡掉），实际 %d", mixed)
+	}
+	if got := harness.Count(t, `SELECT count(*) FROM match_pairs`); got != 2 {
+		t.Errorf("混合批次之后 match_pairs 期望 2 行，实际 %d", got)
+	}
+	if got := harness.Count(t, `SELECT count(*) FROM notifications WHERE title = $1`, "旧对，不该再发"); got != 0 {
+		t.Errorf("旧对那条居然也发了通知，notifications 里 title=「旧对，不该再发」有 %d 行", got)
 	}
 
 	// 空批次不该开事务（§9 的日志噪音问题），也不该报错

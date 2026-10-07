@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -363,6 +364,125 @@ func TestOnCreatedFoundTier2DoesNotWrite(t *testing.T) {
 	if notified == nil || *notified != 0 {
 		t.Errorf("found 帖的 notified_count 应该是 0（指针非空），实际 %v", notified)
 	}
+}
+
+// ---------- #16 改帖：OnUpdated ----------
+
+// TestOnUpdatedFoundWritesTheSameRowAsOnCreated 是「两条路径共用一套写入规则」
+// 的可执行版本 —— 也是这次补 OnUpdated 唯一值得测的理由。
+//
+// 分成两份代码的话，「改帖时通知线算不算」「Tier 2 写不写」「方向会不会反」
+// 每一项都要各自重新推导一遍，而它们的答案必须和发帖时完全一致。
+// 所以这里不逐条重复断言，而是把两次调用的产出**整体比相等**：
+// 谁将来给其中一条路径单独加逻辑，这个测试就会红，而且红得看得见差异。
+func TestOnUpdatedFoundWritesTheSameRowAsOnCreated(t *testing.T) {
+	target := foundWallet(t, 2, 8, "黑色长款钱包", "黑色长款钱包，夹层里有校园卡")
+	perfect := lostWallet(t, 1, 7, "黑色钱包", "黑色钱包，夹层里有校园卡")
+
+	run := func(f func(svc *Match)) []repo.LedgerRow {
+		store := &fakeMatchStore{cands: []model.ItemDetail{*perfect}, recordRet: 1}
+		f(newMatchSvc(t, store, fakeItemGetter{}))
+		if store.recordCalls != 1 {
+			t.Fatalf("RecordMatches 调用次数期望 1，实际 %d", store.recordCalls)
+		}
+		return store.recordRows
+	}
+
+	created := run(func(svc *Match) {
+		_, notified := svc.OnCreated(context.Background(), target)
+		if notified == nil || *notified != 1 {
+			t.Fatalf("OnCreated 的 notified_count 期望 1，实际 %v", notified)
+		}
+	})
+	updated := run(func(svc *Match) { svc.OnUpdated(context.Background(), target) })
+
+	if !reflect.DeepEqual(created, updated) {
+		t.Errorf("改帖写进去的台账行和发帖写的不一致（两条路径必须共用同一套规则）：\ncreated=%s\nupdated=%s",
+			dumpRows(created), dumpRows(updated))
+	}
+	// 上面那句相等如果成立，方向就不可能反（created 的方向由
+	// TestOnCreatedFoundWritesOnlyAboveNotifyLine 逐字段钉过）。这里只额外确认
+	// 改帖这条路径确实也在给**失主**发通知，而不是只留了个日志。
+	if len(updated) != 1 || updated[0].LostItemID != 1 || updated[0].FoundItemID != 2 || updated[0].NotifyTo != 7 {
+		t.Errorf("改帖的通知方向不对：%s", dumpRows(updated))
+	}
+	if updated[0].NotifyTitle == "" || updated[0].NotifyBody == "" {
+		t.Error("改帖这条路径写出来的通知没有标题或正文 —— 发出去会是一条空消息")
+	}
+}
+
+// TestOnUpdatedSkipsLostAndClosed 验 OnUpdated 的两道门槛：不是 found 就不跑，
+// found 但不是 open 也不跑。
+//
+// 「不跑」而不是「跑了不写」是这里要断言的东西，所以连候选 SQL 的调用次数一起查：
+// lost 帖改一次就去捞一遍全表候选，除了浪费一次查询什么都换不来（§5.8：它永远算完就丢）；
+// closed 的拾物帖已经还回去了，再给失主推「可能有匹配」是在骗一个已经结束寻找的人，
+// 而 §8 允许改 closed 帖（改错了的电话必须能改），所以这个判断不能省。
+func TestOnUpdatedSkipsLostAndClosed(t *testing.T) {
+	perfect := foundWallet(t, 2, 8, "黑色钱包", "黑色钱包")
+
+	tests := []struct {
+		name   string
+		target *model.ItemDetail
+		reason string
+	}{
+		{"lost 帖", lostWallet(t, 1, 7, "黑色钱包", "黑色钱包"), "lost 方向的匹配任何时候都只算不写"},
+		{"closed 的 found 帖", func() *model.ItemDetail {
+			d := foundWallet(t, 3, 9, "黑色钱包", "黑色钱包")
+			d.Status = model.ItemStatusClosed
+			return d
+		}(), "东西已经还回去了，不该再通知失主"},
+		{"deleted 的 found 帖", func() *model.ItemDetail {
+			d := foundWallet(t, 4, 10, "黑色钱包", "黑色钱包")
+			d.Status = model.ItemStatusDeleted
+			return d
+		}(), "对外已经不存在的帖子不该出现在任何人的通知里"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeMatchStore{cands: []model.ItemDetail{*perfect}}
+			svc := newMatchSvc(t, store, fakeItemGetter{})
+			svc.OnUpdated(context.Background(), tt.target)
+
+			if len(store.candCalls) != 0 {
+				t.Errorf("不该跑匹配却捞了 %d 次候选（%s）：%s", len(store.candCalls), tt.name, tt.reason)
+			}
+			if store.recordCalls != 0 {
+				t.Errorf("不该跑匹配却写了 %d 次台账：%s", store.recordCalls, tt.reason)
+			}
+		})
+	}
+}
+
+// TestOnUpdatedSwallowsStoreFailure 确认改帖这条路径也一样传不出错误。
+//
+// OnUpdated 没有返回值也没有 error，所以这个测试只能断言「不 panic、不改状态」——
+// 而这正是重点：签名里没有一个能让失败溜到 Update() 的出口。
+// 匹配挂了最坏是「帖子改好了、通知没发出去」，绝不能变成「改帖 500，用户再改一次」。
+func TestOnUpdatedSwallowsStoreFailure(t *testing.T) {
+	boom := errors.New("测试注入：数据库抽风")
+	perfect := lostWallet(t, 1, 7, "黑色钱包", "黑色钱包，夹层里有校园卡")
+
+	t.Run("候选查不到", func(t *testing.T) {
+		store := &fakeMatchStore{candErr: boom}
+		svc := newMatchSvc(t, store, fakeItemGetter{})
+		svc.OnUpdated(context.Background(), foundWallet(t, 2, 8, "黑色钱包", "黑色钱包"))
+		if store.recordCalls != 0 {
+			t.Errorf("候选都没捞到却写了台账 %d 次", store.recordCalls)
+		}
+	})
+
+	t.Run("台账写不进", func(t *testing.T) {
+		store := &fakeMatchStore{cands: []model.ItemDetail{*perfect}, recordErr: boom}
+		svc := newMatchSvc(t, store, fakeItemGetter{})
+		svc.OnUpdated(context.Background(), foundWallet(t, 2, 8, "黑色钱包", "黑色钱包"))
+		if store.recordCalls != 1 {
+			t.Fatalf("台账应该被尝试写一次，实际 %d 次", store.recordCalls)
+		}
+		// 到这里测试就结束了：写失败只变成一条 error 日志，函数正常返回。
+		// 如果哪天有人把 error 往上抛，panic 或编译失败都会先把这件事暴露出来。
+	})
 }
 
 // TestOnCreatedSwallowsStoreFailure 是「匹配失败绝不影响发帖成功」的可执行版本。

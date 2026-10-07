@@ -297,13 +297,15 @@ bash scripts/smoke.sh
 - **M3 匹配 —— 已完成并验收（2026-10-07）**
   §4 的 #20、#44 两条新路由（累计 20 条 / 最终 50 条）+ `internal/matcher`
   （字符 bigram + Dice 相似度、Tier1/Tier2 两套加权打分）。
-  验收实测：纯单测（不连库）auth 59 + middleware 15 + router 7 + service 297 +
-  repo 42 + model 5 + matcher 53 = **478 项全绿**；集成测试 `smoketest`
-  **365 项全绿**（111 个顶层测试函数）；`scripts/smoke.sh` **234 项全绿、0 跳过**。
+  验收实测：纯单测（不连库）auth 59 + middleware 15 + router 7 + service 305 +
+  repo 42 + model 5 + matcher 53 = **481 项全绿**（另有 `router` 里 1 项
+  `TestFinalRouteCount` **按设计 SKIP**，凑满 50 条路由那天才启用）；
+  集成测试 `smoketest` **366 项全绿**（112 个顶层测试函数）；
+  `scripts/smoke.sh` **247 项全绿、0 跳过**。
   几条只有测了才成立的性质：
-  - 通知是**不对称**的：只有**建 found 帖**会写 `match_pairs` 并给 lost 作者发
-    `new_match`；建 lost 帖只算不写（响应里只有 `matches_preview`，
-    **压根不出现 `notified_count` 这个键**）。冒烟脚本两头都测了。
+  - 通知是**不对称**的：只有 **found 帖这一侧**（创建和改帖）会写 `match_pairs` 并给
+    lost 作者发 `new_match`；lost 帖无论是创建还是改帖都只算不写（创建时响应里只有
+    `matches_preview`，**压根不出现 `notified_count` 这个键**）。冒烟脚本两头都测了。
   - `notified_count` 和 `matches_preview` 用了 `*int` / `*[]MatchHit`，
     为的是「0 也要出现」：`notified_count:0` 是去重的证据，
     `matches_preview:[]` 是「没匹配上」的证据 —— 用值类型的话这两个都会变成
@@ -318,9 +320,23 @@ bash scripts/smoke.sh
   - #20 的 `contact` 策略与 #14 完全一致（found 帖一律 `null`），匹配列表
     **绕不过** M4 的解锁与审计。
   - 台账的去重就是 `UNIQUE(lost_item_id, found_item_id)` + `ON CONFLICT DO NOTHING`，
-    没有 `notified` 布尔列。这条**只能直连 repo 测**：换一个新 found 帖就是新的一对，
-    HTTP 层永远走不到 conflict 分支（计划 #20 的判据 ③ 写的就是 HTTP 场景，实际不可达，
-    所以拆成「HTTP 测两条不同配对各发一条」+「repo 测同一配对第二次 0 行」）。
+    没有 `notified` 布尔列。
+  - **对计划的一处修订（2026-10-07，已与用户确认）**：判据 ③ 原文是「重复建同样的
+    found 帖 → `ON CONFLICT` 生效、台账仍一行」，这条**按字面是做不到也不该做的** ——
+    再发一次帖拿到的是新的 `item id`，台账的键是「一对帖子」，那是**另一件拾获物**，
+    该各发一条通知（和定位原则 ③「认领非排他」同一个逻辑）。真正会让同一对第二次
+    参与匹配的动作是**改帖**，而 §5.8 的触发源表里根本没有「编辑」这一行 ——
+    计划前后不一致，于是那条 SQL 无处可达，还留下一个功能洞：小王把「捡到钱包 / 地点其他」
+    改成「黑色长款钱包 / 图书馆」之后系统不会重算，小李永远等不到通知。
+    现在 `Match.OnUpdated` 补上了这条路径（§9 的 `trigger` 多一个值 `found_updated`），
+    判据 ③ 由三条测试分担：改帖→再改帖（走 HTTP，验 `ON CONFLICT`）、
+    repo 直连两次写同一对（验那条 SQL 本身 + 混合批次旧对跳过新对照发）、
+    同一 lost 被两条不同 found 命中（验「不去重才是对的」，防止有人把键改成 `lost_item_id`）。
+    `OnUpdated` 还有两道「不跑」的门槛，都用**全表**行数而不是按 id 数来断言 ——
+    按 `lost_item_id` 数的话，方向写反的脏行会躲过去：
+    lost 帖改帖不跑（不对称是方向的规则，不是发帖的规则）、
+    `closed` 的 found 帖改帖不跑（东西已经还回去了，再推「可能有匹配」是在骗一个寻找已结束的人）。
+    这两条门槛都用「故意改坏实现」验过：去掉哪一道，对应的断言都会红。
   - 两个**只有真 PostgreSQL 才能发现**的坑：`make_interval(hours => $n)` 的
     `hours` 是 integer，传 float8 报的是「函数不存在」（SQLSTATE 42883），
     得用 `secs`；不带类型的锚点参数会被猜成 interval，整条比较变成

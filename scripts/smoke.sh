@@ -1120,6 +1120,103 @@ else
   fi
 fi
 
+# ---- 判据⑥（2026-10-07 补）：改帖重新触发匹配，同一对第二次插入不去重就重复打扰 ----
+#
+# 计划里判据③写的是「重复建同样的 found 帖 → ON CONFLICT 生效」，但走 HTTP 再发一次帖
+# 拿到的是**新的 item id**，台账的键是 (lost_item_id, found_item_id)，永远不构成冲突。
+# 真正会让同一对第二次参与匹配的动作是**改帖**（§3.7 用途① 举的正是这个例子），
+# 所以 service 里补了 Match.OnUpdated，§9 的 trigger 多一个值 found_updated。
+#
+# 这条链同时补了一个功能洞：小王随手发「钱包」、后来改成「黑色长款钱包」，
+# 以前系统不会重算，小李永远等不到通知 —— 现在会。
+lost6="$(printf '{"item_type":"lost","title":"%s 黑色长款钱包","description":"%s 夹层里有一张校园卡","category_id":%d,"location_id":%d,"location_detail":"三楼自习室B区","last_seen_at":"%s","lost_at":"%s","contact":"13800000000"}' \
+  "$M3_TAG" "$M3_TAG" "$CAT_WALLET" "$LOC_ID" "$T_SEEN" "$T_LOST")"
+req POST /api/items "$lost6" "$TOKEN"
+check '⑥ 再建一条同款 lost 返回 HTTP 200' '200' "$STATUS"
+M3_6_LOST_ID="$(itemIDOf "$BODY")"
+
+# 弱文本：标题只有「钱包」、描述留空 → 分数落在通知线以下，发帖时一行都不该写。
+found6="$(printf '{"item_type":"found","title":"钱包","description":"","category_id":%d,"location_id":%d,"location_detail":"三楼自习室B区","found_at":"%s","contact":"wx_smoke_finder6"}' \
+  "$CAT_WALLET" "$LOC_ID" "$T_FOUND")"
+req POST /api/items "$found6" "$TOKEN2"
+check '  ⑥ 弱文本 found 帖返回 HTTP 200' '200' "$STATUS"
+M3_6_FOUND_ID="$(itemIDOf "$BODY")"
+
+if [[ "$HAS_PSQL" != 1 ]]; then
+  skip '⑥ 改帖重匹配 + 第二次不重复通知（本机没有 psql 或连不上开发库）'
+elif [[ -z "$M3_6_FOUND_ID" || -z "$M3_6_LOST_ID" ]]; then
+  skip '⑥ 改帖重匹配（没能取出这一轮的帖子 id）'
+else
+  rows6_before="$(db "SELECT count(*) FROM match_pairs WHERE found_item_id=$M3_6_FOUND_ID")"
+  if [[ "$rows6_before" == "0" ]]; then
+    printf '  %sPASS%s ⑥ 弱文本（分数不到 0.75）发帖时一行台账都没写\n' "$GREEN" "$RESET"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s ⑥ 弱文本却写了 %s 行台账\n' "$RED" "$RESET" "$rows6_before"; fail=$((fail+1))
+  fi
+
+  notif_me6_before="$(db "SELECT count(*) FROM notifications WHERE user_id=$MY_ID AND type='new_match'")"
+  notif_finder6="$(db "SELECT count(*) FROM notifications WHERE user_id=$OTHER_ID")"
+
+  # 把帖子改准 → 同一个 found_item_id 第一次够线 → 写一行、通知失主一次。
+  strong6="$(printf '{"item_type":"found","title":"%s 黑色长款钱包","description":"%s 夹层里有一张校园卡","category_id":%d,"location_id":%d,"location_detail":"三楼自习室B区","found_at":"%s","contact":"wx_smoke_finder6"}' \
+    "$M3_TAG" "$M3_TAG" "$CAT_WALLET" "$LOC_ID" "$T_FOUND")"
+  req PUT "/api/items/$M3_6_FOUND_ID" "$strong6" "$TOKEN2"
+  check '  ⑥ 改帖（弱文本→强文本）返回 HTTP 200' '200' "$STATUS"
+  check '  ⑥ 改准之后这一对进了台账（OnUpdated 真的跑了匹配）' '1' \
+    "$(db "SELECT (count(*)>0)::int FROM match_pairs WHERE found_item_id=$M3_6_FOUND_ID AND lost_item_id=$M3_6_LOST_ID")"
+  notif_me6="$(db "SELECT count(*) FROM notifications WHERE user_id=$MY_ID AND type='new_match'")"
+  rows6_strong="$(db "SELECT count(*) FROM match_pairs WHERE found_item_id=$M3_6_FOUND_ID")"
+  if [[ "$notif_me6" -gt "$notif_me6_before" ]]; then
+    printf '  %sPASS%s ⑥ 失主因为这次改帖收到了 new_match（%s → %s）\n' \
+      "$GREEN" "$RESET" "$notif_me6_before" "$notif_me6"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s ⑥ 台账写了行、失主却没收到通知 —— 两者必须在同一个事务里\n' "$RED" "$RESET"; fail=$((fail+1))
+  fi
+
+  # **判据③的可执行形式**：同一对第二次参与匹配（再改一次，只动 location_detail）。
+  # 少了 ON CONFLICT 的话，小王每改一个字都会把小李通知一遍。
+  pairs_total6="$(db 'SELECT count(*) FROM match_pairs')"
+  # 和 strong6 只差 location_detail：分数不变，仍然够通知线，于是 RecordMatches
+  # 又被调用一次 —— 这次必须被那条唯一约束吃掉。
+  strong6b="$(printf '{"item_type":"found","title":"%s 黑色长款钱包","description":"%s 夹层里有一张校园卡","category_id":%d,"location_id":%d,"location_detail":"一楼大厅服务台","found_at":"%s","contact":"wx_smoke_finder6"}' \
+    "$M3_TAG" "$M3_TAG" "$CAT_WALLET" "$LOC_ID" "$T_FOUND")"
+  req PUT "/api/items/$M3_6_FOUND_ID" "$strong6b" "$TOKEN2"
+  check '  ⑥ 第二次改同一条帖返回 HTTP 200' '200' "$STATUS"
+  if [[ "$(db "SELECT count(*) FROM match_pairs WHERE found_item_id=$M3_6_FOUND_ID")" == "$rows6_strong" ]] \
+     && [[ "$(db 'SELECT count(*) FROM match_pairs')" == "$pairs_total6" ]]; then
+    printf '  %sPASS%s ③ 同一对第二次插入被 ON CONFLICT 挡掉，match_pairs 仍是 %s 行\n' \
+      "$GREEN" "$RESET" "$pairs_total6"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s ③ 第二次改帖多写了台账：%s → %s（重复通知就是这么来的）\n' \
+      "$RED" "$RESET" "$pairs_total6" "$(db 'SELECT count(*) FROM match_pairs')"; fail=$((fail+1))
+  fi
+  if [[ "$(db "SELECT count(*) FROM notifications WHERE user_id=$MY_ID AND type='new_match'")" == "$notif_me6" ]]; then
+    printf '  %sPASS%s ③ 第二次改帖没有再通知失主（仍是 %s 条）\n' \
+      "$GREEN" "$RESET" "$notif_me6"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s ③ 第二次改帖又通知了失主\n' "$RED" "$RESET"; fail=$((fail+1))
+  fi
+  # found 作者在这一整段里始终一条都没被通知（不对称在改帖上同样成立）。
+  if [[ "$(db "SELECT count(*) FROM notifications WHERE user_id=$OTHER_ID")" == "$notif_finder6" ]]; then
+    printf '  %sPASS%s ⑥ 拾物作者改帖前后都没收到任何通知\n' "$GREEN" "$RESET"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s 拾物作者因为改帖被通知了 —— §2.3 明确禁止\n' "$RED" "$RESET"; fail=$((fail+1))
+  fi
+
+  # 改一条 closed 的 found 帖不该再叫醒任何人（§8 允许改 closed 帖，比如改错电话）。
+  req PATCH "/api/items/$M3_6_FOUND_ID/status" '{"status":"closed"}' "$TOKEN2"
+  check '  ⑥ 关掉这条 found 帖返回 HTTP 200' '200' "$STATUS"
+  req PUT "/api/items/$M3_6_FOUND_ID" \
+    "$(printf '{"item_type":"found","title":"%s 黑色长款钱包","description":"%s 夹层里有一张校园卡","category_id":%d,"location_id":%d,"location_detail":"宿管阿姨处","found_at":"%s","contact":"wx_smoke_finder6"}' \
+      "$M3_TAG" "$M3_TAG" "$CAT_WALLET" "$LOC_ID" "$T_FOUND")" "$TOKEN2"
+  check '  ⑥ 改一条 closed 的 found 帖仍然返回 HTTP 200' '200' "$STATUS"
+  if [[ "$(db "SELECT count(*) FROM notifications WHERE user_id=$MY_ID AND type='new_match'")" == "$notif_me6" ]]; then
+    printf '  %sPASS%s ⑥ closed 的 found 帖改帖没有再通知失主（东西已经还回去了）\n' "$GREEN" "$RESET"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s closed 的 found 帖改帖又通知了失主\n' "$RED" "$RESET"; fail=$((fail+1))
+  fi
+fi
+
 # ---------------------------------------------------------------- 封禁
 # 这一步必须直接改库：M6 才有封禁端点。所以它需要 psql 和开发库的凭据，
 # 拿不到就 SKIP —— 这条判据在 backend/smoketest/m1_auth_test.go 里是无条件覆盖的。

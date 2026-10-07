@@ -36,18 +36,19 @@ type DictLookup interface {
 	CountActiveChildren(ctx context.Context, id int64) (int, error)
 }
 
-// MatchRunner 是发帖之后那一步匹配需要的能力。
+// MatchRunner 是发帖 / 改帖之后那一步匹配需要的能力。
 //
-// ⚠ 签名里**没有 error**，这不是遗漏，是 §5.8「匹配失败绝不影响发帖成功」
-// 在类型层面的落实：接口里没有 error，Create 想往上抛也抛不了，
+// ⚠ 两个签名里**都没有 error**，这不是遗漏，是 §5.8「匹配失败绝不影响发帖成功」
+// 在类型层面的落实：接口里没有 error，Create/Update 想往上抛也抛不了，
 // 所有失败只能在 Match 内部变成日志。将来若真需要「匹配失败要报错」，
 // 必须先改这个签名 —— 而改签名会撞上所有 fake，改的人就会停下来想清楚
 // 「为了一个增值功能让用户重发一遍帖子」是不是他要的。
 //
-// 返回值两个都是指针，含义见 Match.OnCreated。用接口而不是直接用 *Match，
+// 返回值是指针而不是值，含义见 Match.OnCreated。用接口而不是直接用 *Match，
 // 是为了给 M3 的集成测试留一个能数调用次数的接缝。
 type MatchRunner interface {
 	OnCreated(ctx context.Context, target *model.ItemDetail) (*[]MatchHit, *int)
+	OnUpdated(ctx context.Context, target *model.ItemDetail)
 }
 
 // Item 是帖子的业务规则：校验、权限、contact 可见性、软删语义、图片删除。
@@ -87,8 +88,8 @@ type CreateItemInput struct {
 //     显示「已经登记好了，之后有人发拾物帖匹配上了我们会通知你」，
 //     键消失了它就只能显示一个空白区块。
 //   - NotifiedCount 用值类型的话 found 帖的 0 和「这不是 found 帖」完全一样，
-//     而 M3 冒烟判据③（重复建同样的 found 帖 → notified_count:0，验 ON CONFLICT
-//     去重）断言的正是「0 出现了」而不是「键消失了」。
+//     而冒烟场景里「建了一条谁都没匹配上的 found 帖 → notified_count:0」
+//     断言的正是「0 出现了」而不是「键消失了」。
 type CreateResult struct {
 	Item model.ItemView `json:"item"`
 
@@ -214,6 +215,9 @@ func (s *Item) Detail(ctx context.Context, viewer *model.User, id int64) (*model
 // ⚠ 不能改的两样东西：item_type（请求体里没有这个字段，类型从库里已有的行取）
 // 和作者（repo.UpdateItemRow 里压根没有 user_id）。
 // 「归属可以转让」是这个系统最不该有的能力，所以它在类型层面就不存在。
+//
+// found 帖改完会重新跑一次匹配（Match.OnUpdated），lost 帖不会 ——
+// 这个不对称是 §5.8 的规矩在改帖上的延续：lost 方向的匹配任何时候都只算不写。
 func (s *Item) Update(ctx context.Context, actor *model.User, id int64, in UpdateItemInput) (*model.ItemView, error) {
 	d, err := s.items.GetByID(ctx, id)
 	if err != nil {
@@ -275,6 +279,16 @@ func (s *Item) Update(ctx context.Context, actor *model.User, id int64, in Updat
 	} else {
 		s.logger.InfoContext(ctx, "item.update", attrs...)
 	}
+
+	// 改准了内容就可能配上一个原本没配上的失主，所以这一步不能只属于 #13。
+	// 传的是**回读出来的那一条**而不是请求体：类型、状态、字典祖先列都只有库里有，
+	// 而匹配方向（found 才写库）和 closed 不通知这两道门槛都在 Match.OnUpdated 里判 ——
+	// 这里无条件调用，规则只有一处，将来加第三种 item_type 也只用改 Match。
+	//
+	// ⚠ 顺序：必须在 items.Update 提交之后。台账的外键指向 items(id)，
+	// 而 score/breakdown 要按改完的值算；反过来写在事务里，一旦匹配报错就会牵连改帖本身
+	// （§5.8 禁止的那种失败传播）。放在提交后，最坏情况是「帖子改好了、通知没发出去」。
+	s.match.OnUpdated(ctx, updated)
 
 	// 操作者刚刚把 contact 作为请求体的一部分提交上来，所以响应里一定回给他 ——
 	// 否则他改完自己（或别人）的帖子，看到的却是一个 null，会以为改丢了。

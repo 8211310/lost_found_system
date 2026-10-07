@@ -27,10 +27,16 @@ import (
 // 分数、分解、通知都只是「系统认为像」，归属永远由双方线下核对，代码里没有任何
 // 「自动认领」「自动判定匹配成功」的状态。
 
-// 三种触发源（§9 的 trigger 字段值）。只有 found_created 会写库，
-// 这个常量列表存在的意义就是把「三个触发源、一个写入路径」写成看得见的事实。
+// 四种触发源（§9 的 trigger 字段值）。只有 found_created 和 found_updated 会写库，
+// 这个常量列表存在的意义就是把「写入路径只有 found 方向」写成看得见的事实。
+//
+// found_updated 是对计划 §5.8 那张三行表的补充：§3.7 用途 ① 说去重保护的是
+// 「同一条 found 帖被编辑后重新触发匹配」，可那张表里根本没有「编辑」这个触发源，
+// 于是 ON CONFLICT 从 HTTP 层永远到不了（新建一次就是新 id，压根不构成冲突）。
+// 补上这条路径之后，判据 ③ 才有可达的场景可测（2026-10-07 与用户确认）。
 const (
 	triggerFoundCreated    = "found_created"
+	triggerFoundUpdated    = "found_updated"
 	triggerLostCreated     = "lost_created"
 	triggerMatchesEndpoint = "matches_endpoint"
 )
@@ -125,8 +131,8 @@ const (
 //     所以不用值类型：§13 验收步骤要求「库里还没有 found 帖时响应带 matches_preview: []」，
 //     而前端要靠「键在但为空」显示那段诚实文案（§2.6.3）。
 //   - item_type=found → notified 永远非 nil（没通知上就是 0，这个 0 必须出现：
-//     M3 冒烟判据③「重复建同样的 found 帖 → notified_count:0」验的就是它归零而不是消失），
-//     preview 永远是 nil。
+//     「这一条 found 帖没够到任何失主」和「这不是 found 帖」在前端是两件事，
+//     键消失了就分不出来），preview 永远是 nil。
 //
 // 两条分支各返回一个非 nil 指针、另一个保持 nil，任何情况下都不会两个都出现。
 //
@@ -159,36 +165,8 @@ func (s *Match) OnCreated(ctx context.Context, target *model.ItemDetail) (*[]Mat
 		return &out.hits, nil
 
 	case model.ItemTypeFound:
-		// 唯一的写入路径。Tier 2 的结果一律不写（§3.7），所以先跑再看档位。
-		out, err := s.run(ctx, runInput{
-			target:  target,
-			trigger: triggerFoundCreated,
-			// 不截断（topN=0）、不低于通知线的不要（minScore=NotifyThreshold）：
-			// 这一档要的是「所有 score≥0.75 的 lost 帖」，不是「前 10 名」。
-			minScore: s.cfg.NotifyThreshold,
-			topN:     0,
-		})
-		if err != nil {
-			s.logFailure(ctx, target, triggerFoundCreated, err)
-			notified := 0
-			return nil, &notified
-		}
-
-		notified := 0
-		if out.tier == matcher.Tier1 && len(out.hits) > 0 {
-			n, err := s.pairs.RecordMatches(ctx, s.ledgerRows(target, out.hits))
-			if err != nil {
-				// 台账没写进去 = 这一对下次还会再试一次通知，
-				// 这是可接受的降级；把错误往上抛则会让用户重发帖子，不可接受。
-				s.logger.ErrorContext(ctx, "match.ledger_failed",
-					slog.Int64("item_id", target.ID),
-					slog.Int("rows", len(out.hits)),
-					slog.String("err", err.Error()))
-			} else {
-				notified = n
-			}
-		}
-		s.logRun(ctx, out, notified)
+		// 唯一的写入路径之一。Tier 2 的结果一律不写（§3.7），所以先跑再看档位。
+		notified := s.notifyMatches(ctx, target, triggerFoundCreated)
 		return nil, &notified
 	}
 
@@ -196,6 +174,69 @@ func (s *Match) OnCreated(ctx context.Context, target *model.ItemDetail) (*[]Mat
 	// 不 panic 是因为「发帖类型校验」和「匹配方向」分处两个函数，
 	// 将来加第三种 item_type 时这里安静地什么都不做，比崩在半路好排查。
 	return nil, nil
+}
+
+// OnUpdated 是 #16 改帖之后的匹配入口，签名和 OnCreated 一样**没有 error**
+// （同一条纪律：改帖已经落库了，匹配失败不能把它报成 500 让用户再改一次）。
+//
+// 这条路径补的是那个具体的洞：小王捡到钱包时随手写了「捡到钱包」+ 地点「其他」，
+// 没匹配上；后来他把帖子改准了。没有 OnUpdated 的话系统不会再算一次，
+// 于是小李永远等不到那条通知 —— 而 §3.7 用途 ① 写去重时假设的正是这条路径存在。
+//
+// 两道门槛，都是「不跑」而不是「跑了不写」：
+//   - **只有 found 帖**。lost 方向的匹配按 §5.8 永远算完就丢，改帖没有可写的东西，
+//     跑一次只是白跑一遍 SQL。不对称要在代码里保持对称的简单：
+//     入口有两个（OnCreated / OnUpdated），方向规则只有一处（这里 + notifyMatches）。
+//   - **状态必须是 open**。closed 的拾物帖意味着东西已经还回去了，
+//     这时候再给失主推一条「可能有匹配」是在骗一个已经结束寻找的人；
+//     而 §8 允许改 closed 帖（改错了的电话必须能改），所以这个判断不能省。
+//
+// 返回值刻意是空的：#16 的响应形状（§4）里只有 item，没有 notified_count。
+// 改帖的人想知道匹配情况有 #20 可查，把计数塞进响应会让 #16 的契约随类型变化，
+// 而那是 #13 才需要的复杂度。数字进 match.run 日志，一处都不少。
+func (s *Match) OnUpdated(ctx context.Context, target *model.ItemDetail) {
+	if target.ItemType != model.ItemTypeFound || target.Status != model.ItemStatusOpen {
+		return
+	}
+	s.notifyMatches(ctx, target, triggerFoundUpdated)
+}
+
+// notifyMatches 跑一次 found 方向的匹配，把 score≥通知线的配对写台账、发通知。
+//
+// OnCreated 和 OnUpdated 共用这一个函数，为的是「两条路径的去重规则必须一模一样」：
+// 分成两份代码的话，将来谁改了一份（比如把通知线调低、或者给改帖加个「先删旧行再插」），
+// 另一份还留着老规矩，而这两种改法都会让重复通知回来。
+// 台账的 UNIQUE + ON CONFLICT 是去重的全部机制，这里没有任何额外状态。
+func (s *Match) notifyMatches(ctx context.Context, target *model.ItemDetail, trigger string) int {
+	out, err := s.run(ctx, runInput{
+		target:  target,
+		trigger: trigger,
+		// 不截断（topN=0）、不低于通知线的不要（minScore=NotifyThreshold）：
+		// 这一档要的是「所有 score≥0.75 的 lost 帖」，不是「前 10 名」。
+		minScore: s.cfg.NotifyThreshold,
+		topN:     0,
+	})
+	if err != nil {
+		s.logFailure(ctx, target, trigger, err)
+		return 0
+	}
+
+	notified := 0
+	if out.tier == matcher.Tier1 && len(out.hits) > 0 {
+		n, err := s.pairs.RecordMatches(ctx, s.ledgerRows(target, out.hits))
+		if err != nil {
+			// 台账没写进去 = 这一对下次还会再试一次通知，
+			// 这是可接受的降级；把错误往上抛则会让用户重发帖子，不可接受。
+			s.logger.ErrorContext(ctx, "match.ledger_failed",
+				slog.Int64("item_id", target.ID),
+				slog.Int("rows", len(out.hits)),
+				slog.String("err", err.Error()))
+		} else {
+			notified = n
+		}
+	}
+	s.logRun(ctx, out, notified)
+	return notified
 }
 
 // List 是 #20 GET /api/items/:id/matches（JWT，本人或 Admin）。
