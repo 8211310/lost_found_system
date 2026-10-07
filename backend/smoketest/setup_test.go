@@ -135,12 +135,24 @@ func setup(dsn string) (*Harness, error) {
 	// cfg 必须是**能通过 Setup 内部校验**的：M1 起 Setup 会真的 new 一个
 	// auth.TokenSigner，它拒绝空密钥和非正有效期。
 	// 密钥只活在这个测试进程里，和任何环境的真密钥无关。
+	//
+	// ⚠ M3 起 Match 那四个字段**必须有值，而且必须和 .env.example 的默认值一致**。
+	// 留成零值的话 NotifyThreshold 是 0 —— 任何一条候选都会越过通知线，
+	// 「只给 score≥0.75 的 lost 作者发通知」这条规则会被静默跳过，
+	// 而测试看起来完全正常（通知确实发出去了，只是发得太宽）。
+	// 阈值属于运营参数（§9），不写进 cfg 就等于测了一个生产不存在的配置。
 	cfg := config.Config{
 		Env:           "test",
 		JWTSecret:     "smoketest-secret-0123456789abcdef0123456789abcdef",
 		JWTExpire:     time.Hour,
 		UploadDir:     uploadDir,
 		UploadBaseURL: "/uploads",
+		Match: config.MatchConfig{
+			TimeToleranceHours: 24,
+			DecayDays:          14,
+			NotifyThreshold:    0.75,
+			ShowThreshold:      0.55,
+		},
 	}
 
 	engine, err := router.Setup(cfg, pool)

@@ -89,6 +89,12 @@ section() { printf '\n%s== %s ==%s\n' "$DIM" "$1" "$RESET"; }
 #   那条检查会假绿。所以本脚本里所有出现在 URL 里的非 ASCII 都写成百分号编码，
 #   并在旁边注释出它对应的中文 —— 失败信息里看到的仍是 %E5%86%92 这种可读性差的东西，
 #   但那至少是**诚实**的可读性差。
+#
+# ⚠ M3 之后 #13 的响应里出现了**第二个** `"item":{"id":…}` —— 它是 matches_preview
+#   数组里每一条匹配的候选帖（MatchHit 的形状就是 {item, score, breakdown}）。
+#   `"item":\{"id":([0-9]+)` 因此会抠到候选帖的 id 而不是刚建出来那条，
+#   而且因为候选是别人发的帖，症状是后面整段「本人改帖」变成 403 FORBIDDEN，
+#   看起来像是权限模块坏了。全部五处抽取一律改用 `itemIDOf`（锚在 `"data":{` 上）。
 STATUS=""; BODY=""
 req() {
   local method="$1" path="$2" body="${3:-}" token="${4:-}"
@@ -190,6 +196,14 @@ make_fake "$txt_path" 'this is not an image, it is a text file: ' 512
 #   author.id、images[].id 五六个 id。这里一律带上紧邻的上下文（`"item":\{"id":`），
 #   宁可难读也不能抠错 —— 抠错比抠不到更糟，它会静默地测另一件事。
 jval() { printf '%s' "$1" | sed -nE "s|.*$2.*|\1|p" | head -1; }
+
+# itemIDOf <json> —— 抠出 #13 建出来那条帖子自己的 id。
+#
+# 为什么不直接写 jval 的模式：M3 之后同一个响应里有**好几个** `"item":{"id":`
+# （matches_preview 数组里每条候选帖都是这个形状），而 `.*` 是最长匹配，
+# 拿到的是最后一个 —— 也就是别人那条帖子的 id。后面所有「本人改帖」因此变成 403，
+# 症状长得像权限模块坏了。锚在信封的 `"data":{` 上就只有唯一一处。
+itemIDOf() { jval "$1" '"data":\{"item":\{"id":([0-9]+)'; }
 
 # psql 可执行文件的位置。
 #
@@ -572,7 +586,7 @@ lost_json="$(printf '{"item_type":"lost","title":"冒烟：黑色长款钱包","
   "$CAT_ID" "$LOC_ID" "$PIC1" "$PIC2" "$PIC3")"
 req POST /api/items "$lost_json" "$TOKEN"
 check '建 lost（带三张图）返回 HTTP 200' '200'          "$STATUS"
-LOST_ID="$(jval "$BODY" '"item":\{"id":([0-9]+)')"
+LOST_ID="$(itemIDOf "$BODY")"
 check '  data.item.status 是 open'    '"status":"open"' "$BODY"
 check '  三张图都挂上了，从 images[0] 开始有序' '"images":[{"id":' "$BODY"
 # 请求里写的是 +08:00，回来的必须是同一个时刻的 UTC 写法（§3.1「时间一律存 UTC」）
@@ -585,7 +599,7 @@ found_json="$(printf '{"item_type":"found","title":"冒烟：捡到一个卡包"
   "$CAT_ID" "$LOC_ID")"
 req POST /api/items "$found_json" "$TOKEN"
 check '建 found 返回 HTTP 200'        '200'          "$STATUS"
-FOUND_ID="$(jval "$BODY" '"item":\{"id":([0-9]+)')"
+FOUND_ID="$(itemIDOf "$BODY")"
 check '  found 帖没有 lost_at / last_seen_at' '"lost_at":""' "$BODY"
 
 # ---- 判据点名的那几条拒绝 ----
@@ -919,7 +933,194 @@ else
   skip 'admin 通道全套（没有 psql，无法把用户提成 admin）'
 fi
 
-# ---- 封禁 ----
+# ---------------------------------------------------------------- M3 匹配
+section "M3 匹配：#13 发帖时触发 + #20 查询（§12 判据①–⑤）"
+
+# 这一节测的是「发帖之后系统在背后做了什么」，而那些事有一大半在 HTTP 响应里看不见。
+# 所以每条判据都是「响应 + 直接数库」两半 —— 这正是 §10 第③层相对第②层的唯一增量。
+#
+# ⚠ 计数一律用 before/after 的**增量**，不写绝对值：这个脚本打的是开发库，
+#   里面有上一轮、上上一轮留下的帖子。而「恰好 1 行」那种判据只有在干净库上才成立
+#   （backend/smoketest/m3_match_test.go 里 TruncateAll 之后钉的就是恰好 1）。
+#   本轮编号也因此进了标题和描述 —— 让上一轮的帖子尽量别也跨过 0.75 的通知线，
+#   否则 notified_count 一轮比一轮大，日志里就看不出这次到底匹配上了什么。
+#
+# 但有三条判据是**精确**的，和库里有没有残留无关，所以下面直接按字面断言：
+#   ④ lost 帖创建一行都不写；⑤ 地点「其他」的帖一行都不写；#20 查询本身一行都不写。
+M3_TAG="m3$(date +%s)$RANDOM"
+CAT_WALLET=36   # 衣物箱包 → 钱包，和 LOC_ID=70（图书馆）配成「同一个东西」的那一对
+LOC_OTHER=3     # 「其他」：level 1 叶子、is_freeform=true、parent_id NULL —— Tier 1 的前提不成立
+
+# 三个时刻都相对 now（UTC），这样「found_at 落在丢失窗口里 → S_time=1.0」
+# 是这条链自己保证的，不依赖跑脚本的那一天：
+#   last_seen 3 小时前 → found 90 分钟前 → lost_at 2 小时前
+# 注意顺序：lost_at 必须**晚于** last_seen_at（M2 那条时间校验会拒反的），
+# 而 found_at 夹在中间，才是 §5.3 说的「在你意识到丢之前就被捡到了」。
+T_SEEN="$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)"
+T_LOST="$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+T_FOUND="$(date -u -d '-90 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+
+pairs_before="$(db 'SELECT count(*) FROM match_pairs')"
+notif_me_before="$(db "SELECT count(*) FROM notifications WHERE user_id=$MY_ID AND type='new_match'")"
+notif_other_before="$(db "SELECT count(*) FROM notifications WHERE user_id=$OTHER_ID")"
+
+# ---- 判据④：建 lost 帖只算不写 ----
+lost_m3="$(printf '{"item_type":"lost","title":"%s 黑色长款钱包","description":"%s 夹层里有一张校园卡","category_id":%d,"location_id":%d,"location_detail":"三楼自习室B区","last_seen_at":"%s","lost_at":"%s","contact":"13800000000"}' \
+  "$M3_TAG" "$M3_TAG" "$CAT_WALLET" "$LOC_ID" "$T_SEEN" "$T_LOST")"
+req POST /api/items "$lost_m3" "$TOKEN"
+check '④ 建 lost（钱包@图书馆）返回 HTTP 200' '200' "$STATUS"
+M3_LOST_ID="$(itemIDOf "$BODY")"
+check '  ④ 响应里有 matches_preview 键（空命中也必须是 []，不能整个消失）' '"matches_preview":[' "$BODY"
+if [[ "$BODY" == *'"notified_count"'* ]]; then
+  printf '  %sFAIL%s lost 帖的响应里出现了 notified_count —— §4：这两个键按 item_type 互斥\n' "$RED" "$RESET"; fail=$((fail+1))
+else
+  printf '  %sPASS%s lost 帖的响应里没有 notified_count（lost 方向谁都不通知）\n' "$GREEN" "$RESET"; pass=$((pass+1))
+fi
+
+# ---- 判据②：建 found 帖才写台账、才发通知，而且只给 lost 作者发 ----
+found_m3="$(printf '{"item_type":"found","title":"%s 黑色长款钱包","description":"%s 夹层里有一张校园卡","category_id":%d,"location_id":%d,"location_detail":"三楼自习室B区","found_at":"%s","contact":"wx_smoke_finder"}' \
+  "$M3_TAG" "$M3_TAG" "$CAT_WALLET" "$LOC_ID" "$T_FOUND")"
+req POST /api/items "$found_m3" "$TOKEN2"
+check '② 建 found（同分类同地点、时间在窗口内）返回 HTTP 200' '200' "$STATUS"
+M3_FOUND_ID="$(itemIDOf "$BODY")"
+check_re '  ② data.notified_count 出现了（哪怕是 0 也必须出现，那是去重的证据）' \
+  '"notified_count":[0-9]+' "$BODY"
+if [[ "$BODY" == *'"matches_preview"'* ]]; then
+  printf '  %sFAIL%s found 帖的响应里出现了 matches_preview —— §2.3「平台不会通知 found 任何东西」\n' "$RED" "$RESET"; fail=$((fail+1))
+else
+  printf '  %sPASS%s found 帖的响应里没有 matches_preview\n' "$GREEN" "$RESET"; pass=$((pass+1))
+fi
+
+# ---- 判据①：#20 的 tier 1 形状（三个信号、权重之和 1.0、没有 attr、没有 location）----
+req GET "/api/items/$M3_LOST_ID/matches" '' "$TOKEN"
+check '① 本人查匹配返回 HTTP 200'   '200'          "$STATUS"
+check '  code 是 OK'                '"code":"OK"' "$BODY"
+check "  ① 本轮那条 found 帖出现在列表里（id=$M3_FOUND_ID）" "\"id\":$M3_FOUND_ID," "$BODY"
+check '  ① tier 是 1（同地点 + 时间在窗口内，严格模式的前提成立）' '"tier":1' "$BODY"
+check '  ① 每个信号都带 weight 和 score（前端要按它渲染分解表）' '"category":{"weight":' "$BODY"
+if [[ "$BODY" == *'"attr"'* ]]; then
+  printf '  %sFAIL%s breakdown 里有 attr —— S_attr 已经随 color/brand 两列一起删掉了（§5.4）\n' "$RED" "$RESET"; fail=$((fail+1))
+else
+  printf '  %sPASS%s breakdown 里没有 attr 信号\n' "$GREEN" "$RESET"; pass=$((pass+1))
+fi
+# Tier 1 只有三个信号：地点是**硬筛选条件**而不是打分项，所以那个键必须整个不存在。
+# 「存在但 weight 为 0」是另一种实现，它会让 breakdown 的加权和对不上总分。
+if [[ "$BODY" == *'"location"'* ]]; then
+  printf '  %sFAIL%s Tier 1 的 breakdown 里有 location 信号\n' "$RED" "$RESET"; fail=$((fail+1))
+else
+  printf '  %sPASS%s Tier 1 的 breakdown 里没有 location 信号（0.45/0.40/0.15 三条加起来正好 1.0）\n' "$GREEN" "$RESET"; pass=$((pass+1))
+fi
+if [[ "$BODY" == *'"notice"'* ]]; then
+  printf '  %sFAIL%s Tier 1 带了放宽筛选的横幅文案（那是 Tier 2 才该出现的东西）\n' "$RED" "$RESET"; fail=$((fail+1))
+else
+  printf '  %sPASS%s Tier 1 没有横幅文案\n' "$GREEN" "$RESET"; pass=$((pass+1))
+fi
+# 匹配列表里 found 候选的联系方式必须是锁着的 —— 它不能成为 M4 #21 的旁路。
+if [[ "$BODY" == *wx_smoke_finder* ]]; then
+  printf '  %sFAIL%s 匹配列表里出现了 found 帖的 contact（wx_smoke_finder）—— 认领名单会因此不再完整\n' "$RED" "$RESET"; fail=$((fail+1))
+else
+  printf '  %sPASS%s 匹配列表里没有 found 帖的 contact（和 #14 同一条规则）\n' "$GREEN" "$RESET"; pass=$((pass+1))
+fi
+
+# ---- #20 鉴权与参数 ----
+req GET "/api/items/$M3_LOST_ID/matches"
+check '#20 不带 token → HTTP 401'   '401'                  "$STATUS"
+check '  code 是 UNAUTHORIZED'      '"code":"UNAUTHORIZED"' "$BODY"
+req GET "/api/items/$M3_LOST_ID/matches" '' "$TOKEN2"
+check '  别人的帖子 → HTTP 403（§4：本人或 Admin）' '403' "$STATUS"
+check '  code 是 FORBIDDEN'         '"code":"FORBIDDEN"' "$BODY"
+# 三个查询参数都在 handler 里原样收下、在 service 里解析，所以非法值必须变成
+# 带字段名的 VALIDATION，而不是「静默用默认值」—— 后者会让用户看到的列表和 URL 不一致。
+req GET "/api/items/$M3_LOST_ID/matches?tier=3" '' "$TOKEN"
+check '  tier=3 → HTTP 400'         '400'                  "$STATUS"
+check '    错误指向 tier'           '"field":"tier"' "$BODY"
+req GET "/api/items/$M3_LOST_ID/matches?top=0" '' "$TOKEN"
+check '  top=0 → HTTP 400（不是悄悄变成 10）' '400' "$STATUS"
+req GET "/api/items/$M3_LOST_ID/matches?min_score=1.5" '' "$TOKEN"
+check '  min_score=1.5 → HTTP 400'  '400'                  "$STATUS"
+
+# ---- 判据⑤：地点选「其他」→ Tier 2，四个信号 + 横幅，而且照样一行都不写 ----
+freeform_m3="$(printf '{"item_type":"lost","title":"%s 黑色长款钱包","description":"%s 夹层里有一张校园卡","category_id":%d,"location_id":%d,"location_detail":"图书馆三楼","last_seen_at":"%s","lost_at":"%s","contact":"13900000000"}' \
+  "$M3_TAG" "$M3_TAG" "$CAT_WALLET" "$LOC_OTHER" "$T_SEEN" "$T_LOST")"
+pairs_before_t2="$(db 'SELECT count(*) FROM match_pairs')"
+req POST /api/items "$freeform_m3" "$TOKEN"
+check '⑤ 建 lost（地点：其他）返回 HTTP 200' '200' "$STATUS"
+M3_T2_ID="$(itemIDOf "$BODY")"
+# 这条是**精确**的：#13 只跑 Tier 1，而 Tier 1 的前提在这里不成立（没有叶子可比），
+# 所以预览一定是空数组 —— 库里有没有别的帖子都改不了这个结论。
+check '  ⑤ 发帖时的预览是 []（#13 只做 Tier 1，绝不偷偷放宽）' '"matches_preview":[]' "$BODY"
+
+req GET "/api/items/$M3_T2_ID/matches" '' "$TOKEN"
+check '  ⑤ 查匹配时 auto 降到 Tier 2 → HTTP 200' '200' "$STATUS"
+check '  ⑤ tier 是 2'               '"tier":2'     "$BODY"
+check '  ⑤ 带提示文案（前端靠它显示黄色横幅）' '"notice":"' "$BODY"
+check '  ⑤ 四个信号：多出 location 那一档' '"location":{"weight":' "$BODY"
+check '  ⑤ 放宽了地点之后确实捞到了那条图书馆的拾物帖' "\"id\":$M3_FOUND_ID," "$BODY"
+# 显式要 Tier 1 时**不**偷偷放宽：给空列表才是诚实的答案。
+req GET "/api/items/$M3_T2_ID/matches?tier=1" '' "$TOKEN"
+check '  ⑤ 显式 tier=1 → 仍然是 1 档、list 为空' '"tier":1,"list":[]' "$BODY"
+
+# ---- 三处「一行都不写」，只能直接数库 ----
+# ④ lost 帖创建、⑤ Tier 2 的结果、#20 查询本身。
+# 判据③说的「重复不产生第二行」在这里的可执行形式就是最后这一条：
+# 用户反复刷新详情页不该往台账里灌数据（§3.7）。
+if [[ "$HAS_PSQL" != 1 ]]; then
+  skip '台账/通知的增量（本机找不到 psql，或连不上开发库）'
+else
+  pairs_now="$(db 'SELECT count(*) FROM match_pairs')"
+  notif_me="$(db "SELECT count(*) FROM notifications WHERE user_id=$MY_ID AND type='new_match'")"
+  notif_other="$(db "SELECT count(*) FROM notifications WHERE user_id=$OTHER_ID")"
+
+  pairs_delta=$((pairs_now - pairs_before))
+  if [[ "$pairs_delta" -ge 1 ]]; then
+    printf '  %sPASS%s ② match_pairs 新增了 %d 行（found 帖创建这条路径是唯一会写的）\n' \
+      "$GREEN" "$RESET" "$pairs_delta"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s ② 建了 matched 的 found 帖，match_pairs 却一行都没加（%s → %s）\n' \
+      "$RED" "$RESET" "$pairs_before" "$pairs_now"; fail=$((fail+1))
+  fi
+  if [[ $((notif_me - notif_me_before)) -ge 1 ]]; then
+    printf '  %sPASS%s ② lost 作者（我）收到 %d 条 new_match\n' \
+      "$GREEN" "$RESET" $((notif_me - notif_me_before)); pass=$((pass+1))
+  else
+    printf '  %sFAIL%s ② lost 作者一条通知都没收到 —— 整个 M3 的存在理由就是这一条\n' "$RED" "$RESET"; fail=$((fail+1))
+  fi
+  # 这条是**精确**的：found 作者永远不该因为匹配被通知，和残留数据无关。
+  if [[ "$notif_other" == "$notif_other_before" ]]; then
+    printf '  %sPASS%s ② found 作者的通知数没变（§2.3：平台不会通知 found 任何东西）\n' "$GREEN" "$RESET"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s found 作者被通知了：从 %s 条变成 %s 条\n' \
+      "$RED" "$RESET" "$notif_other_before" "$notif_other"; fail=$((fail+1))
+  fi
+
+  # ⑤ 之后仍然不写：Tier 2 的结果一律不进台账（§3.7）
+  if [[ "$(db 'SELECT count(*) FROM match_pairs')" == "$pairs_before_t2" ]]; then
+    printf '  %sPASS%s ⑤ 地点「其他」的帖（Tier 2）一行都没写台账\n' "$GREEN" "$RESET"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s Tier 2 的结果被写进了台账\n' "$RED" "$RESET"; fail=$((fail+1))
+  fi
+
+  # #20 查询本身：再读两次，台账和通知都必须纹丝不动
+  read_only_before="$(db 'SELECT count(*) FROM match_pairs')"
+  req GET "/api/items/$M3_LOST_ID/matches" '' "$TOKEN"
+  req GET "/api/items/$M3_LOST_ID/matches?tier=2" '' "$TOKEN"
+  if [[ "$(db 'SELECT count(*) FROM match_pairs')" == "$read_only_before" ]]; then
+    printf '  %sPASS%s ③ 刷了两次 #20，match_pairs 仍是 %s 行（查询接口只读）\n' \
+      "$GREEN" "$RESET" "$read_only_before"; pass=$((pass+1))
+  else
+    printf '  %sFAIL%s 查询接口往台账里灌了数据：%s → %s\n' \
+      "$RED" "$RESET" "$read_only_before" "$(db 'SELECT count(*) FROM match_pairs')"; fail=$((fail+1))
+  fi
+
+  # 落库的那一行确实带了 breakdown（JSONB 列），这是 §5.7「调试器」的数据源。
+  # 数一下本轮这一对有没有行，而不是数某一行——中文标题不能当 psql 参数（代码页转换）。
+  if [[ -n "$M3_FOUND_ID" ]]; then
+    check '  台账里能按 found_item_id 查到本轮那一对' '1' \
+      "$(db "SELECT (count(*)>0)::int FROM match_pairs WHERE found_item_id=$M3_FOUND_ID")"
+  fi
+fi
+
+# ---------------------------------------------------------------- 封禁
 # 这一步必须直接改库：M6 才有封禁端点。所以它需要 psql 和开发库的凭据，
 # 拿不到就 SKIP —— 这条判据在 backend/smoketest/m1_auth_test.go 里是无条件覆盖的。
 if [[ "$HAS_PSQL" != 1 ]]; then

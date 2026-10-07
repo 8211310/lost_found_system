@@ -101,12 +101,23 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 
 	dictRepo := repo.NewDict(pool)
 	itemRepo := repo.NewItem(pool)
+	matchRepo := repo.NewMatch(pool)
 
 	dictSvc := service.NewDict(dictRepo)
-	itemSvc := service.NewItem(itemRepo, dictRepo, uploads, slog.Default())
+
+	// 装配顺序：matchSvc 必须在 itemSvc 之前 —— 发帖service 拿着 MatchRunner 这个接缝，
+	// 而它的实现就是 matchSvc。谁把两行调了个，编译期就会报「未定义」，
+	// 不用启动时才在 nil 上炸。
+	//
+	// cfg.Match 传进去而不是让 service 自己读环境变量：调参是运维的事，
+	// 「阈值现在是 0.75 还是 0.80」必须能在 /api/debug/config 里看到（§9），
+	// 藏在 service 里读 os.Getenv 就看不见了，而且测试没法换掉它。
+	matchSvc := service.NewMatch(matchRepo, itemRepo, uploads, cfg.Match, slog.Default())
+	itemSvc := service.NewItem(itemRepo, dictRepo, uploads, matchSvc, slog.Default())
 
 	dictH := handler.Dict{Svc: dictSvc}
 	itemH := handler.Item{Svc: itemSvc}
+	matchH := handler.Match{Svc: matchSvc}
 	uploadH := handler.Upload{Svc: uploads}
 
 	// #40 静态文件。挂在 engine 上而不是 api 组里：计划里的路径就是
@@ -147,6 +158,12 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	api.DELETE("/item-images/:id", jwt, itemH.DeleteImage)
 
 	// ---- M3：匹配（#20）----
+	//
+	// #20 走 jwt 而不是 OptionalJWT：匹配结果里带着另一批帖子的作者昵称和
+	// 「这两条可能是一个东西」的推断，§4 的鉴权列写的是「本人或 Admin」，
+	// 匿名请求既不是本人也不是 Admin，那就该 401，而不是认成匿名后给一个空列表。
+	api.GET("/items/:id/matches", jwt, matchH.Matches)
+
 	// ---- M4：解锁·通知·举报（#21、#22、#30–#32、#41）----
 	// ---- M5：归还确认·积分（#23–#29、#33）----
 	// ---- M6：治理与管理后台（#9–#12、#34–#37、#39、#43–#50）----

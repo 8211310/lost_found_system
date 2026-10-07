@@ -35,6 +35,7 @@ var expectedRoutes = []string{
 	"GET /api/my/items",              // #19
 	"GET /uploads/*filepath",         // #40
 	"DELETE /api/item-images/:id",    // #42
+	"GET /api/items/:id/matches",     // #20
 }
 
 // testConfig 给 Setup 一份**能通过校验**的最小配置。

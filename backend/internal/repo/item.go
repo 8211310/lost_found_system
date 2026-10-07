@@ -33,7 +33,11 @@ func NewItem(pool *pgxpool.Pool) *Item { return &Item{pool: pool} }
 const itemDetailCols = `i.id, i.item_type, i.user_id, i.title, i.description, i.category_id,
 	i.location_id, i.location_detail, i.last_seen_at, i.lost_at, i.found_at, i.contact,
 	i.status, i.view_count, i.created_at, i.updated_at,
-	c.name, l.name, u.nickname, COALESCE(cover.path, '')`
+	c.name, l.name, u.nickname, COALESCE(cover.path, ''),
+	COALESCE(c.parent_id, 0)  AS category_parent_id,
+	COALESCE(lp.id, 0)        AS location_parent_id,
+	COALESCE(lt.id, 0)        AS location_top_id,
+	l.is_freeform`
 
 // itemDetailFrom 是配套的 FROM 子句。
 //
@@ -49,10 +53,20 @@ const itemDetailCols = `i.id, i.item_type, i.user_id, i.title, i.description, i.
 //   - 用它而不是 `min(sort_order)` 再自连接：那样拿不到图片 id，而且写起来长得多。
 //   - ORDER BY sort_order, id 里的 id 是为了让「同一 sort_order 的多张图」也有确定顺序，
 //     否则分页翻页时同一张图可能在两页都出现（PG 不保证等值行的稳定顺序）。
+//
+// 最后两个 LEFT JOIN locations（lp = 父、lt = 祖父）是 M3 加进来的，为的是打分要能比较祖先：
+// 「同大类不同小类给 0.5」和「同二级子类 0.6 / 同一级区 0.3」都要拿父节点比，
+// 而 items 表里只有叶子 id。不做这两次 JOIN 的话，匹配就得对每个候选再发两次字典点查，
+// 那正是上面 LATERAL 要避免的 N+1。
+// 用 LEFT JOIN 而不是 INNER：地点树里的「其他」是 level=1 的叶子，它没有父节点，
+// INNER 会把选了这个地点的帖子整条变隐形（帖子从广场上消失，而原因是一条字典行）。
+// COALESCE 成 0 之后 matcher 拿 0 当「没有这一级」，比较时一句 != 0 就挡掉。
 const itemDetailFrom = ` FROM items i
 	 JOIN categories c ON c.id = i.category_id
 	 JOIN locations  l ON l.id = i.location_id
 	 JOIN users      u ON u.id = i.user_id
+	 LEFT JOIN locations lp ON lp.id = l.parent_id
+	 LEFT JOIN locations lt ON lt.id = lp.parent_id
 	 LEFT JOIN LATERAL (
 	     SELECT path FROM item_images im
 	      WHERE im.item_id = i.id
@@ -511,5 +525,6 @@ func scanItemDetailRows(row pgx.Row, d *model.ItemDetail) error {
 		&d.LocationID, &d.LocationDetail, &d.LastSeenAt, &d.LostAt, &d.FoundAt, &d.Contact,
 		&d.Status, &d.ViewCount, &d.CreatedAt, &d.UpdatedAt,
 		&d.CategoryName, &d.LocationName, &d.AuthorNickname, &d.CoverPath,
+		&d.CategoryParentID, &d.LocationParentID, &d.LocationTopID, &d.LocationIsFreeform,
 	)
 }

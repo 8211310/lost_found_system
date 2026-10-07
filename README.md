@@ -294,7 +294,43 @@ bash scripts/smoke.sh
     删完 `item_images` 少一行、磁盘文件消失、帖子和其余图片都在，
     封面由 #14 的 `LEFT JOIN LATERAL ... ORDER BY sort_order LIMIT 1` 现算，不需要「重算封面」的代码。
   - admin 改别人的帖**必须带 `admin_reason`**，且改不动作者 —— 归属是改不了的（原则 5）。
-- **未开工**：M3 匹配 · M4 解锁·通知·举报 ·
+- **M3 匹配 —— 已完成并验收（2026-10-07）**
+  §4 的 #20、#44 两条新路由（累计 20 条 / 最终 50 条）+ `internal/matcher`
+  （字符 bigram + Dice 相似度、Tier1/Tier2 两套加权打分）。
+  验收实测：纯单测（不连库）auth 59 + middleware 15 + router 7 + service 297 +
+  repo 42 + model 5 + matcher 53 = **478 项全绿**；集成测试 `smoketest`
+  **365 项全绿**（111 个顶层测试函数）；`scripts/smoke.sh` **234 项全绿、0 跳过**。
+  几条只有测了才成立的性质：
+  - 通知是**不对称**的：只有**建 found 帖**会写 `match_pairs` 并给 lost 作者发
+    `new_match`；建 lost 帖只算不写（响应里只有 `matches_preview`，
+    **压根不出现 `notified_count` 这个键**）。冒烟脚本两头都测了。
+  - `notified_count` 和 `matches_preview` 用了 `*int` / `*[]MatchHit`，
+    为的是「0 也要出现」：`notified_count:0` 是去重的证据，
+    `matches_preview:[]` 是「没匹配上」的证据 —— 用值类型的话这两个都会变成
+    字段消失，而字段消失和「没匹配上」在客户端看不出区别。
+  - Tier1 三条信号（cat 0.45 / text 0.40 / time 0.15）**权重和必须为 1**，
+    且 `Σ(w×s)` 恰等于外层 `score`；断言是按键集合相等做的，
+    多一条 `attr` 也会红 —— 计划里删掉的东西不能阴魂不散。
+  - **Tier2 永不写台账**：测的是一对自由地点、总分 0.82（> 通知阈值 0.75）的帖子，
+    依然 0 行。用低分配对测不出这条规则，只有高分还拒绝才证明「是 tier 决定的」。
+  - #20 **只读**：连点两次 GET，台账和通知数量一行都不涨；错参数（`tier=3`、
+    `limit=abc` 等 6 种）全得 `VALIDATION`；`user_id` 来自 JWT，别人的帖得 403。
+  - #20 的 `contact` 策略与 #14 完全一致（found 帖一律 `null`），匹配列表
+    **绕不过** M4 的解锁与审计。
+  - 台账的去重就是 `UNIQUE(lost_item_id, found_item_id)` + `ON CONFLICT DO NOTHING`，
+    没有 `notified` 布尔列。这条**只能直连 repo 测**：换一个新 found 帖就是新的一对，
+    HTTP 层永远走不到 conflict 分支（计划 #20 的判据 ③ 写的就是 HTTP 场景，实际不可达，
+    所以拆成「HTTP 测两条不同配对各发一条」+「repo 测同一配对第二次 0 行」）。
+  - 两个**只有真 PostgreSQL 才能发现**的坑：`make_interval(hours => $n)` 的
+    `hours` 是 integer，传 float8 报的是「函数不存在」（SQLSTATE 42883），
+    得用 `secs`；不带类型的锚点参数会被猜成 interval，整条比较变成
+    `timestamptz <= interval`，必须写 `$n::timestamptz` —— 而且转型只加在参数上，
+    列名一旦包上函数，索引就用不上了。
+  - 匹配把 `"item":{"id":…}` 也塞进了 `matches_preview`，于是冒烟脚本里
+    取新建帖 id 的 `jval '"item":\{"id":([0-9]+)'` 贪婪匹配到了**候选帖**的 id，
+    级联出 14 个 M2 FAIL（「只能操作自己发布的帖子」）。换成锚定行首的
+    `itemIDOf()` 才恢复 —— 这不是 M3 的功能 bug，是 M3 让一个既有断言变松了。
+- **未开工**：M4 解锁·通知·举报 ·
   M5 归还确认·积分 · M6 治理与管理后台 · M7 前端 · M8 杭电助手 SSO（外部阻塞中）
 
 路由清单见 `internal/router/router.go` —— 那是 §4 全部 50 条路由的唯一注册点，

@@ -70,6 +70,24 @@ type ItemDetail struct {
 	// CoverPath 是排序最前的那张图的相对路径，没有图时为空串。
 	// 由 SQL 里的 LEFT JOIN LATERAL 一次取回（见 repo/item.go）。
 	CoverPath string
+
+	// ---------- 下面四个字段只为匹配算法服务（§5.2、§5.5），一律不出现在任何对外 JSON 里 ----------
+	//
+	// 打分要比较祖先，而 items 表里只有叶子 id：
+	//   - 分类「同大类不同小类给 0.5」要比 CategoryParentID
+	//   - 地点「同二级子类 0.6 / 同一级区 0.3」要比 LocationParentID / LocationTopID
+	// 所以连表的时候顺路把 l 的父和祖父一起 JOIN 出来（见 repo/item.go 的 lp / lt），
+	// 否则每个候选都要再发两次字典点查，N 个候选就是 2N 次往返。
+	//
+	// 三个 id 都用 0 表示「没有这一级」（SQL 里 COALESCE 过），而不是 -1 或指针：
+	// 0 不可能是任何一行的 id，比较时一句 != 0 就能挡住「两个空祖先被判成同一个」。
+	// 典型例子就是地点树里的「其他」—— 它是 level=1 的叶子，本来就没有父节点。
+	CategoryParentID int64
+	LocationParentID int64
+	LocationTopID    int64
+	// LocationIsFreeform 来自 l.is_freeform：true 就是选了「其他」，
+	// 没有叶子节点可比，这条帖子直接跳过 Tier 1 进 Tier 2（§5.5、§3.6）。
+	LocationIsFreeform bool
 }
 
 // RefView 是「一个字典条目的最小对外形状」。

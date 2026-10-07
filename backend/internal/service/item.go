@@ -36,19 +36,34 @@ type DictLookup interface {
 	CountActiveChildren(ctx context.Context, id int64) (int, error)
 }
 
+// MatchRunner 是发帖之后那一步匹配需要的能力。
+//
+// ⚠ 签名里**没有 error**，这不是遗漏，是 §5.8「匹配失败绝不影响发帖成功」
+// 在类型层面的落实：接口里没有 error，Create 想往上抛也抛不了，
+// 所有失败只能在 Match 内部变成日志。将来若真需要「匹配失败要报错」，
+// 必须先改这个签名 —— 而改签名会撞上所有 fake，改的人就会停下来想清楚
+// 「为了一个增值功能让用户重发一遍帖子」是不是他要的。
+//
+// 返回值两个都是指针，含义见 Match.OnCreated。用接口而不是直接用 *Match，
+// 是为了给 M3 的集成测试留一个能数调用次数的接缝。
+type MatchRunner interface {
+	OnCreated(ctx context.Context, target *model.ItemDetail) (*[]MatchHit, *int)
+}
+
 // Item 是帖子的业务规则：校验、权限、contact 可见性、软删语义、图片删除。
 type Item struct {
 	items   ItemStore
 	dict    DictLookup
 	uploads *Upload
+	match   MatchRunner
 	logger  *slog.Logger
 }
 
-func NewItem(items ItemStore, dict DictLookup, uploads *Upload, logger *slog.Logger) *Item {
+func NewItem(items ItemStore, dict DictLookup, uploads *Upload, match MatchRunner, logger *slog.Logger) *Item {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Item{items: items, dict: dict, uploads: uploads, logger: logger}
+	return &Item{items: items, dict: dict, uploads: uploads, match: match, logger: logger}
 }
 
 // ---------- 请求/响应形状 ----------
@@ -62,16 +77,23 @@ type CreateItemInput struct {
 
 // CreateResult 是 #13 的 data。
 //
-// M3 会在这里加两个**互斥的可选**字段（计划 §4 #13 与「#13 的响应为什么有两个
-// 互斥的可选字段」一节）：
+// 后两个字段是**互斥的可选**字段（计划 §4 #13 与「#13 的响应为什么有两个互斥的
+// 可选字段」一节）：lost 帖只带 matches_preview，found 帖只带 notified_count。
 //
-//	MatchesPreview []MatchHit `json:"matches_preview,omitempty"` // 仅 item_type=lost
-//	NotifiedCount  *int       `json:"notified_count,omitempty"`  // 仅 item_type=found
-//
-// 现在不加，是因为 matcher 包还不存在 —— 加两个恒为零值的字段只会让前端
-// 以为「匹配已经能用了」。M2 的 Create() 里已经标出了 M3 该插在哪一步。
+// 两个都是指针而不是「值 + omitempty」，为的是能表达「空数组也要出现」：
+//   - MatchesPreview 用值类型 + omitempty 的话，一条都没匹配上时整个键会消失
+//     （Go 的 omitempty 把 len==0 的切片也算空），而 §13 验收步骤明确写着
+//     库里还没有 found 帖时响应要带 `matches_preview: []` —— 前端要靠「键在但为空」
+//     显示「已经登记好了，之后有人发拾物帖匹配上了我们会通知你」，
+//     键消失了它就只能显示一个空白区块。
+//   - NotifiedCount 用值类型的话 found 帖的 0 和「这不是 found 帖」完全一样，
+//     而 M3 冒烟判据③（重复建同样的 found 帖 → notified_count:0，验 ON CONFLICT
+//     去重）断言的正是「0 出现了」而不是「键消失了」。
 type CreateResult struct {
 	Item model.ItemView `json:"item"`
+
+	MatchesPreview *[]MatchHit `json:"matches_preview,omitempty"` // 仅 item_type=lost，top 5
+	NotifiedCount  *int        `json:"notified_count,omitempty"`  // 仅 item_type=found，被推了 new_match 的 lost 作者数
 }
 
 // UpdateItemInput 是 #16 PUT /api/items/:id 的输入。
@@ -131,15 +153,18 @@ func (s *Item) Create(ctx context.Context, userID int64, in CreateItemInput) (*C
 		return nil, err
 	}
 
-	// ---- M3 的接入点 ----
-	// 计划 §4「#13 的响应为什么有两个互斥的可选字段」写得很死：
-	//   lost  → 同步跑 Tier 1，取前 5 条塞进 data.matches_preview，
-	//           **不写 match_pairs、不写 notifications、谁都不通知**
-	//   found → 同步跑 Tier 1，对每个 score≥0.75 的 lost 帖写 match_pairs
-	//           （ON CONFLICT DO NOTHING）并给它的作者发 new_match，
-	//           data.notified_count = 真正新发出去的通知条数
-	//   匹配失败只记 error 日志，**绝不影响发帖成功**
-	// 所以现在这个位置就是将来插一次匹配调用的地方，前后都不用动。
+	// ---- M3：发帖后的匹配，方向由 item_type 决定（§5.8 那张表的落地）----
+	//
+	// 位置在「帖子已经落库」之后、构造响应之前，且**同步执行**（不开 goroutine）：
+	// found 帖的 notified_count 是响应体的一部分，异步就算不出这个数；
+	// 而 lost 帖的 matches_preview 是发帖成功页要直接渲染的东西（§2.6.2 第 3 步），
+	// 用户点完提交就看到结果，不该等一次轮询。
+	//
+	// ⚠ 这个调用**不可能往数据库写 posts 以外的东西**：Match.OnCreated 里
+	// lost 分支根本不碰 RecordMatches（§4 的实现检查点：matches_preview 分支
+	// 不允许出现任何 INSERT）。这一点在 M3 的集成测试里用「发一条 lost 帖之后
+	// match_pairs 和 notifications 都是 0 行」钉死。
+	preview, notified := s.match.OnCreated(ctx, d)
 
 	s.logger.InfoContext(ctx, "item.create",
 		slog.Int64("item_id", d.ID),
@@ -154,7 +179,7 @@ func (s *Item) Create(ctx context.Context, userID int64, in CreateItemInput) (*C
 	if err != nil {
 		return nil, err
 	}
-	return &CreateResult{Item: *view}, nil
+	return &CreateResult{Item: *view, MatchesPreview: preview, NotifiedCount: notified}, nil
 }
 
 // ---------- #15 详情 ----------
