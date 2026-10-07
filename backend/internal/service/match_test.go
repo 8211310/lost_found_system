@@ -220,7 +220,7 @@ func (f fakeItemGetter) GetByID(_ context.Context, id int64) (*model.ItemDetail,
 	return d, nil
 }
 
-func newMatchSvc(t *testing.T, store *fakeMatchStore, getter MatchItemGetter) *Match {
+func newMatchSvc(t *testing.T, store *fakeMatchStore, getter ItemLookup) *Match {
 	t.Helper()
 	uploads, err := NewUpload(t.TempDir(), "/uploads", nil)
 	if err != nil {

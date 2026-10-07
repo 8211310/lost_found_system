@@ -36,6 +36,13 @@ var expectedRoutes = []string{
 	"GET /uploads/*filepath",         // #40
 	"DELETE /api/item-images/:id",    // #42
 	"GET /api/items/:id/matches",     // #20
+	// ---- M4 ----
+	"POST /api/items/:id/unlock-contact",     // #21
+	"GET /api/items/:id/contact-views",       // #22
+	"GET /api/my/notifications",              // #30
+	"GET /api/my/notifications/unread-count", // #31
+	"PUT /api/my/notifications/read",         // #32
+	"POST /api/items/:id/report",             // #41
 }
 
 // testConfig 给 Setup 一份**能通过校验**的最小配置。
@@ -116,7 +123,10 @@ func TestSetupRegistersExactlyTheExpectedRoutes(t *testing.T) {
 // TestFinalRouteCount 是计划 §10 那条「断言条数 == 50」的落点。
 func TestFinalRouteCount(t *testing.T) {
 	if !planComplete {
-		t.Skip("计划还没走完（当前 19 条）；M6 收尾时把本文件的 planComplete 改成 true，这条测试就会开始要求 50 条")
+		// 条数用 len() 而不是写死：这条信息每个里程碑都要变，写死的那一份迟早会过期，
+		// 而过期的注释比没有注释更坏（M3 就因为 README 里一个过期数字被更正过一次）。
+		t.Skipf("计划还没走完（当前 %d 条）；M6 收尾时把本文件的 planComplete 改成 true，这条测试就会开始要求 50 条",
+			len(expectedRoutes))
 	}
 	if len(expectedRoutes) != 50 {
 		t.Fatalf("§4 规定最终是 50 条路由，expectedRoutes 里现在有 %d 条", len(expectedRoutes))

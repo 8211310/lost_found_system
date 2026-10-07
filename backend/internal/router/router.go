@@ -102,6 +102,9 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	dictRepo := repo.NewDict(pool)
 	itemRepo := repo.NewItem(pool)
 	matchRepo := repo.NewMatch(pool)
+	contactRepo := repo.NewContact(pool)
+	notifRepo := repo.NewNotification(pool)
+	reportRepo := repo.NewReport(pool)
 
 	dictSvc := service.NewDict(dictRepo)
 
@@ -113,11 +116,23 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	// 「阈值现在是 0.75 还是 0.80」必须能在 /api/debug/config 里看到（§9），
 	// 藏在 service 里读 os.Getenv 就看不见了，而且测试没法换掉它。
 	matchSvc := service.NewMatch(matchRepo, itemRepo, uploads, cfg.Match, slog.Default())
-	itemSvc := service.NewItem(itemRepo, dictRepo, uploads, matchSvc, slog.Default())
+	// contactRepo 在这里出现两次，而且必须是同一个实例：
+	// itemSvc 只拿它的读能力（ContactViewLookup，判「这位读者解锁过没有」），
+	// contactSvc 拿它的写能力（解锁那一行由 #21 产生）。
+	// 传两个 new 出来的实例不会出错（都连着同一个 pool），但会让「谁能写 contact_views」
+	// 这件事在装配图上看不出唯一答案。
+	contactSvc := service.NewContact(contactRepo, itemRepo, slog.Default())
+	notifSvc := service.NewNotification(notifRepo, slog.Default())
+	reportSvc := service.NewReport(reportRepo, itemRepo, slog.Default())
+
+	itemSvc := service.NewItem(itemRepo, dictRepo, uploads, matchSvc, contactRepo, slog.Default())
 
 	dictH := handler.Dict{Svc: dictSvc}
 	itemH := handler.Item{Svc: itemSvc}
 	matchH := handler.Match{Svc: matchSvc}
+	contactH := handler.Contact{Svc: contactSvc}
+	notifH := handler.Notification{Svc: notifSvc}
+	reportH := handler.Report{Svc: reportSvc}
 	uploadH := handler.Upload{Svc: uploads}
 
 	// #40 静态文件。挂在 engine 上而不是 api 组里：计划里的路径就是
@@ -165,6 +180,30 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	api.GET("/items/:id/matches", jwt, matchH.Matches)
 
 	// ---- M4：解锁·通知·举报（#21、#22、#30–#32、#41）----
+
+	// #21 解锁联系方式。POST 而不是 GET /items/:id/contact：
+	// 这次请求**要往 contact_views 写一行**，它是一个事实记录，不是一个读取动作。
+	// 用 GET 的话浏览器预取、爬虫、任何「顺手访问一下」都会凭空制造解锁记录，
+	// 而那份日志正是 §3.4 说的「骚扰的唯一事后证据」—— 它必须只由真实点击产生。
+	api.POST("/items/:id/unlock-contact", jwt, contactH.Unlock)
+
+	// #22 解锁名单。鉴权（发帖人或 Admin）在 service 里判，不在这里 ——
+	// 因为「谁算发帖人」要先把那条帖子查出来，那是业务而不是路由。
+	api.GET("/items/:id/contact-views", jwt, contactH.Views)
+
+	// #30 #31 #32 全部收在 /api/my/notifications 下面：收件箱是「谁的」永远来自 JWT。
+	//
+	// 三条都挂 jwt 而不是 OptionalJWT：匿名请求没有「我的」，
+	// 这里没有「认不出就给个空列表」的合理语义 —— 空列表和未登录是两件事，
+	// 前端会把后者当成「你一条通知都没有」显示出来。
+	api.GET("/my/notifications", jwt, notifH.List)
+	api.GET("/my/notifications/unread-count", jwt, notifH.UnreadCount)
+	api.PUT("/my/notifications/read", jwt, notifH.MarkRead)
+
+	// #41 举报。注意它**只有一条 INSERT**：不自动下架、不扣分、不通知被举报人。
+	// 处置它的 #48/#49 在 M6，且只有 Admin 能挂。
+	api.POST("/items/:id/report", jwt, reportH.Create)
+
 	// ---- M5：归还确认·积分（#23–#29、#33）----
 	// ---- M6：治理与管理后台（#9–#12、#34–#37、#39、#43–#50）----
 

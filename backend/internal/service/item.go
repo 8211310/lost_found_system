@@ -51,20 +51,42 @@ type MatchRunner interface {
 	OnUpdated(ctx context.Context, target *model.ItemDetail)
 }
 
+// ItemLookup 是「只要按 id 取一条帖子」的那些服务共用的接缝。
+//
+// 三处用它，且三处的判断都只依赖帖子本身的三个属性（类型、状态、作者）：
+//   - #20 匹配（Match.OnCreated / Matches）—— 要目标帖的全部字段
+//   - #21 解锁、#22 名单（Contact）—— 要类型、状态、user_id
+//   - #41 举报（Report）—— 要存在性和状态
+//
+// 为什么不直接用 ItemStore（它有八个方法）：给这三个服务写单测的 fake
+// 就得实现六个永远用不到的方法，那种 fake 会让人干脆不写这个测试（§10 第①层的原话）。
+// 反过来才是关键：**接口里没有写方法，服务就越权不了**。
+// Contact 服务拿不到 Create/Update/Delete，所以「解锁时顺手改一下帖子状态」
+// 这种代码在类型层面就写不出来。
+type ItemLookup interface {
+	GetByID(ctx context.Context, id int64) (*model.ItemDetail, error)
+}
+
 // Item 是帖子的业务规则：校验、权限、contact 可见性、软删语义、图片删除。
 type Item struct {
 	items   ItemStore
 	dict    DictLookup
 	uploads *Upload
 	match   MatchRunner
-	logger  *slog.Logger
+	// contacts 只为 #15 的第三条可见性规则存在（「已解锁过就放行」），只读、不写。
+	// M2 那版这里什么都没有，因为当时全站没有任何代码能往 contact_views 写行；
+	// M4 加了 #21 之后，这一格必须接上，否则 found 帖的 contact 对全世界永远是 null，
+	// 而定位原则 2 说的恰恰是「联系方式是能联系到本人的唯一选项」。
+	contacts ContactViewLookup
+	logger   *slog.Logger
 }
 
-func NewItem(items ItemStore, dict DictLookup, uploads *Upload, match MatchRunner, logger *slog.Logger) *Item {
+func NewItem(items ItemStore, dict DictLookup, uploads *Upload, match MatchRunner,
+	contacts ContactViewLookup, logger *slog.Logger) *Item {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Item{items: items, dict: dict, uploads: uploads, match: match, logger: logger}
+	return &Item{items: items, dict: dict, uploads: uploads, match: match, contacts: contacts, logger: logger}
 }
 
 // ---------- 请求/响应形状 ----------
@@ -555,7 +577,7 @@ func (s *Item) buildView(ctx context.Context, d *model.ItemDetail, viewer *model
 		})
 	}
 
-	locked := !forceContact && contactLocked(&d.Item, viewer)
+	locked := s.contactLockedAfterLookup(ctx, d, viewer, forceContact)
 	var contact *string
 	if !locked {
 		contact = &d.Contact
@@ -563,6 +585,45 @@ func (s *Item) buildView(ctx context.Context, d *model.ItemDetail, viewer *model
 
 	v := d.View(contact, locked, views)
 	return &v, nil
+}
+
+// contactLockedAfterLookup 是计划 §4「#15 的 contact 可见性规则」的完整落地。
+//
+// 前半段是纯函数 contactLocked（只看类型和身份），后半段是那次查库。
+// 分成两段的理由写在 contactLocked 的注释里：那两条纯规则能被表驱动单测扫尽，
+// 而「查库」这一步只能拿 fake store 测，两段的测法本来就不该混在一起。
+//
+// 三条不打扰的规则按代价从低到高排：
+//   - lost 帖 / 作者本人 → 纯函数就返回 false，**一次查询都不发**
+//   - 匿名的 found 请求 → 直接锁，也不发查询（没有 id 可查，发了是白费）
+//     这是 #15 作为公开接口的常态路径，省掉这一次往返是有意义的
+//   - 已登录的非作者 → 才走 idx_contact_views_user 那一次点查
+//
+// ⚠ 查询失败一律**按锁着处理**，并且不把错误往上抛：
+//   - 往上抛意味着 #15 这个「未登录也能逛」的公开接口在 contact_views 出问题时
+//     整条帖子读不出来 —— 用户看到的是广场点进详情就 500。
+//   - 反过来，「查询失败但放行」是把别人的手机号发出去。
+//     两个后果不对称：前者是体验受损，后者是隐私事故，所以这里 fail closed。
+//     失败本身进日志，不静默。
+func (s *Item) contactLockedAfterLookup(ctx context.Context, d *model.ItemDetail, viewer *model.User, forceContact bool) bool {
+	if forceContact || !contactLocked(&d.Item, viewer) {
+		return false
+	}
+	if viewer == nil {
+		return true
+	}
+
+	viewed, err := s.contacts.Viewed(ctx, d.ID, viewer.ID)
+	if err != nil {
+		s.logger.WarnContext(ctx, "contact.viewed_lookup_failed",
+			slog.Any("err", err),
+			slog.Int64("item_id", d.ID),
+			slog.Int64("user_id", viewer.ID),
+			slog.String("action", "按锁着处理（fail closed）"),
+		)
+		return true
+	}
+	return !viewed
 }
 
 // canSeeDeleted 报告 viewer 能不能看一条已软删的帖子。

@@ -51,24 +51,20 @@ type MatchStore interface {
 	RecordMatches(ctx context.Context, rows []repo.LedgerRow) (int, error)
 }
 
-// MatchItemGetter 只取 #20 需要的一个能力：按 id 拿目标帖。
-//
-// 不复用 ItemStore（它有八个方法）：给 #20 写 fake 时要实现七个永远用不到的方法，
-// 那种 fake 会让人干脆不写这个测试。
-type MatchItemGetter interface {
-	GetByID(ctx context.Context, id int64) (*model.ItemDetail, error)
-}
-
 // Match 是匹配的业务对象。
+//
+// items 那一格是 ItemLookup（只要 GetByID 一个能力），不是 ItemStore：
+// M3 最该被钉死的规则是「拿到的这条帖子是不是 #20 的目标帖」，
+// 用一个只有点查的接口，fake 里就不可能出现任何写入方法。
 type Match struct {
 	pairs   MatchStore
-	items   MatchItemGetter
+	items   ItemLookup
 	uploads *Upload
 	cfg     config.MatchConfig
 	logger  *slog.Logger
 }
 
-func NewMatch(pairs MatchStore, items MatchItemGetter, uploads *Upload, cfg config.MatchConfig, logger *slog.Logger) *Match {
+func NewMatch(pairs MatchStore, items ItemLookup, uploads *Upload, cfg config.MatchConfig, logger *slog.Logger) *Match {
 	if logger == nil {
 		logger = slog.Default()
 	}

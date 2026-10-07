@@ -262,22 +262,23 @@ func validateImagePaths(paths []string) error {
 	return nil
 }
 
-// contactLocked 是计划 §4「#15 的 contact 可见性规则」的逐行落地。
-//
-//	viewer 为 nil（未登录）且是 found 帖 → 锁着
+// contactLocked 是计划 §4「#15 的 contact 可见性规则」那四行伪代码里
+// **不查库的前两行 + 最后一行**。
 //
 // 完整规则（照抄计划）：
 //
 //	if item.item_type == 'lost':       不锁     # lost 帖联系方式公开
 //	elif 当前用户是发帖人:              不锁     # 自己的帖子当然能看
-//	elif 已登录且 contact_views 有记录:  不锁     # 已解锁过
+//	elif 已登录且 contact_views 有记录:  不锁     # 已解锁过   ← 这一条在 Item 服务里查库
 //	else:                              锁
 //
-// ⚠ 第三条**在 M4 才接上**（#21 解锁接口是 M4 的活，M2 还没有任何代码能往
-// contact_views 里写行）。现在这里只有前两条，M4 要做的就是在 viewer != nil 的
-// 分支里加一次 EXISTS 查询。规则的形状现在就定好，是为了让 M4 加的是「一个分支」
-// 而不是「重写这个函数」—— 这条逻辑是全系统最容易写错的地方之一
-// （写错的后果是把别人的联系方式公开出去），所以它必须是一个能一眼读完的纯函数。
+// 所以这个函数返回 true 的确切含义是「**光看身份还不能放行**」，而不是
+// 「最终就是锁着的」：登录后非作者看 found 帖时，还要经过
+// (*Item).contactLockedAfterLookup 那一次 EXISTS 查询才能定案。
+// 之所以不把这个函数改成返回 error 直接查库：它是全系统最容易写错的一段逻辑
+// （写错的后果是把别人的联系方式公开出去），而一个纯函数能被表驱动单测
+// 一遍扫尽（§10 第①层），加上 error 就必须在测试里造 fake store 才跑得动。
+// 拆成「纯身份判断 + 一次查库」两段，各自都能被各自的方式测透。
 func contactLocked(it *model.Item, viewer *model.User) bool {
 	if it.ItemType == model.ItemTypeLost {
 		return false
@@ -285,7 +286,6 @@ func contactLocked(it *model.Item, viewer *model.User) bool {
 	if viewer != nil && viewer.ID == it.UserID {
 		return false
 	}
-	// M4: 已登录且 contact_views 里有 (it.ID, viewer.ID) 一行 → return false
 	return true
 }
 
@@ -474,4 +474,33 @@ type Page[T any] struct {
 	Total    int `json:"total"`
 	Page     int `json:"page"`
 	PageSize int `json:"page_size"`
+}
+
+// PageQuery 是「只有分页参数」的那类端点用的输入（#22 解锁名单、#30 收件箱）。
+//
+// 不复用 ListQuery：那个有八个字段，为它写的 fake 或调用点都得先想清楚
+// 「其余八个字段在这里是什么意思」。分页是这两个端点唯一的查询参数，
+// 就用一个只有两个字段的结构体。
+//
+// 同样是**原始字符串**而不是 int：解析失败要能报出字段名的中文 VALIDATION。
+type PageQuery struct {
+	Page     string
+	PageSize string
+}
+
+// parsePageQuery 解析 page / page_size，缺省走 §4 的统一约定 ?page=1&page_size=20。
+//
+// 上限沿用 maxPageSize：这三个字（page_size）在所有分页端点上的值域必须是同一个，
+// 否则前端一个通用的分页组件就得按端点配不同的 max，
+// 而配错的那一个表现为「翻到第 200 页就空了」这种没人会当成 bug 报的行为。
+func parsePageQuery(q PageQuery) (page, pageSize int, err error) {
+	page, err = parseIntParam("page", q.Page, defaultPage, 1, 1<<30)
+	if err != nil {
+		return 0, 0, err
+	}
+	pageSize, err = parseIntParam("page_size", q.PageSize, defaultPageSize, 1, maxPageSize)
+	if err != nil {
+		return 0, 0, err
+	}
+	return page, pageSize, nil
 }
