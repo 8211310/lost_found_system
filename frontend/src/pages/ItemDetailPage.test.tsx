@@ -371,3 +371,94 @@ describe('举报（入口要弱，文案不许诺后果）', () => {
     expect(screen.queryByText('已记录，管理员会看到。')).not.toBeInTheDocument()
   })
 })
+
+describe('作者操作（#16 入口 / #18 开关 / #17 软删）', () => {
+  /** 自己的、联系方式本来就可见的一条拾物帖（作者 id 8）。 */
+  const mine = (overrides: Parameters<typeof sampleItemView>[0] = {}) =>
+    sampleItemView({ author: { id: 8, nickname: '小王' }, contact: '微信 bbb', contact_locked: false, ...overrides })
+
+  it('这一栏只给发帖人，admin 也不给', async () => {
+    // #18 后端写的就是「仅帖主，admin 也不行」：关一条帖子是「东西还回来了」这个社区表态，
+    // admin 能销毁内容但制造不出归属。所以这里连按钮都不出现，而不是点下去吃 FORBIDDEN。
+    setToken('jwt.admin')
+    mockMe(sampleUser({ id: 9, role: 'admin' }))
+    mockDetail(mine())
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('捡到黑色长款钱包')
+    expect(screen.queryByRole('button', { name: '标记为已归还' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '删除这条帖子' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: '修改' })).not.toBeInTheDocument()
+  })
+
+  it('#18 发的是取反后的那一个状态，标题跟着库里的 status 走', async () => {
+    const user = userEvent.setup()
+    setToken('jwt.xiaowang')
+    mockMe(sampleUser({ id: 8 }))
+    mockDetail(mine())
+    const bodies: Array<Record<string, unknown>> = []
+    server.use(
+      http.patch(`${BASE}/api/items/:id/status`, async ({ request }) => {
+        const body = (await request.json()) as Record<string, unknown>
+        bodies.push(body)
+        return HttpResponse.json(ok({ id: 202, status: body.status }))
+      }),
+    )
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await user.click(await screen.findByRole('button', { name: '标记为已归还' }))
+    await waitFor(() => expect(bodies).toHaveLength(1))
+    expect(bodies[0]).toEqual({ status: 'closed' })
+    expect(await screen.findByText('已归还')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '修改' })).toHaveAttribute('href', '/items/202/edit')
+
+    // 再点一次方向反过来。后端对「已经是这个状态」幂等返回成功，
+    // 所以前端不需要自己判重，只需要每次按当前 status 取反、然后按响应更新那一个字段。
+    await user.click(screen.getByRole('button', { name: '重新开放' }))
+    await waitFor(() => expect(bodies).toHaveLength(2))
+    expect(bodies[1]).toEqual({ status: 'open' })
+    expect(screen.queryByText('已归还')).not.toBeInTheDocument()
+  })
+
+  it('#17 是两步：第一个点击只出那句「没有撤销」，第二个才发 DELETE', async () => {
+    const user = userEvent.setup()
+    setToken('jwt.xiaowang')
+    mockMe(sampleUser({ id: 8 }))
+    mockDetail(mine())
+    let deletes = 0
+    server.use(
+      http.delete(`${BASE}/api/items/:id`, () => {
+        deletes += 1
+        return HttpResponse.json(ok(null))
+      }),
+    )
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await user.click(await screen.findByRole('button', { name: '删除这条帖子' }))
+    // 这一条是这一屏的存亡线：软删之后广场和搜索都拿不到它，而普通用户没有恢复端点
+    //（那是 admin 的 #44），所以「点一下就删」是不允许的交互。
+    expect(deletes).toBe(0)
+    expect(screen.getByText(/没有撤销/)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '确认删除' }))
+    await waitFor(() => expect(deletes).toBe(1))
+    // 删完不留在原地：那条详情页的 status 已经是 deleted，停在这儿只会让人以为没删掉。
+    expect(await screen.findByText('广场页桩')).toBeInTheDocument()
+  })
+
+  it('已经不在架的帖子不再给任何操作入口', async () => {
+    setToken('jwt.xiaowang')
+    mockMe(sampleUser({ id: 8 }))
+    mockDetail(mine({ status: 'deleted' }))
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('捡到黑色长款钱包')
+    // #16 和 #18 在这种状态上直接返回 ITEM_CLOSED，所以按钮出现即注定失败。
+    expect(screen.queryByText('这条是你发的')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /已归还|重新开放/ })).not.toBeInTheDocument()
+  })
+})

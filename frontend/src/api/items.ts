@@ -1,18 +1,25 @@
-// src/api/items.ts —— §4 的 #14 #15 #20 #21 #41（M7 片 2：广场、详情、匹配、解锁、举报）。
+// src/api/items.ts —— §4 的 items 一族。
 //
-// 只写这一片用得到的。#13/#16/#17/#18/#19/#22/#42/#6 也早就实现好了，但它们要么属于后面那片 UI
-// （#19/#22 在「我的」，片 4），要么还没有对应的入口（#16/#17/#18/#42/#6 在发布编辑页，片 3）。
-// 现在建函数就是建死代码 —— 加了之后没人调用，等到真用时读者无法判断它是预留还是用过。
+// 片 2：#14 广场 #15 详情 #20 匹配 #21 解锁 #41 举报。
+// 片 3：#13 发帖 #16 改帖 #17 删帖 #18 开关状态 #42 删单张图（发布/编辑页 + 详情页的作者操作）。
+// 还没人调用所以还没写：#19 #22（在「我的」，片 4）。
+// 「用到才建」不是为了少写代码，而是因为没人调用的函数会被读者当成预留，
+// 等后面那片真要用时，没人能确定它是死的还是活的。
+//
 // 每条都写清鉴权，因为前端必须知道「匿名能不能读」：#14 #15 公开，其余全要登录。
-import { getJSON, postJSON } from './client'
+import { deleteJSON, getJSON, patchJSON, postJSON, putJSON } from './client'
 import type {
+  CreateItemPayload,
+  CreateItemResult,
   ItemSummary,
   ItemView,
   MatchResult,
   Page,
   ReportReasonCode,
   ReportResult,
+  StatusResult,
   UnlockResult,
+  UpdateItemPayload,
 } from './types'
 
 /** #14 的筛选参数。全部可选 —— 空串/undefined 一律不拼进 URL，
@@ -72,4 +79,41 @@ export function unlockContact(id: number | string): Promise<UnlockResult> {
  *  所以这里的返回类型里没有任何「处理进度」字段，前端也不许自己编一个。 */
 export function reportItem(id: number | string, reason: ReportReasonCode, detail = ''): Promise<ReportResult> {
   return postJSON<ReportResult>(`/api/items/${id}/report`, { reason_code: reason, detail })
+}
+
+/** #13 POST /api/items（JWT）。
+ *  ⚠ 写操作，而且它同时在后端触发匹配：lost 只算不写，found 会写台账并通知失主。
+ *  所以它只能由「点提交」触发，绝不能出现在 useEffect 里。
+ *  响应里的 matches_preview / notified_count 是**这一次**算出来的，没有任何 GET 能再取到，
+ *  成功页必须把这份数据接过去（见 pages/PostResultPage.tsx 顶部那段）。 */
+export function createItem(payload: CreateItemPayload): Promise<CreateItemResult> {
+  return postJSON<CreateItemResult>('/api/items', payload)
+}
+
+/** #16 PUT /api/items/:id（JWT，本人或 Admin）。
+ *  image_paths 一律不传（见 UpdateItemPayload 上那段：整组替换 + 响应不给 path = 客户端重建不出完整集合）。
+ *  帖主改一条 found 帖会**重新触发匹配**（§3.7 那个「先随手发一条、后来改准」的例子），
+ *  改一条 closed 的也一样，只是后端不会再叫醒任何人。 */
+export function updateItem(id: number | string, payload: UpdateItemPayload): Promise<ItemView> {
+  return putJSON<ItemView>(`/api/items/${id}`, payload)
+}
+
+/** #17 DELETE /api/items/:id（JWT，本人或 Admin）—— 软删，status→deleted，行还在库里。
+ *  帖主删自己的帖子请求体可空，所以这里什么都不发。 */
+export function deleteItem(id: number | string): Promise<null> {
+  return deleteJSON<null>(`/api/items/${id}`)
+}
+
+/** #18 PATCH /api/items/:id/status（JWT，**仅帖主**，admin 也不行）。
+ *  只有 open / closed 两个值：deleted 是治理动作（#43），不是社区表态。
+ *  后端对「已经是这个状态」幂等返回成功，所以连点两次不该收到错误。 */
+export function changeItemStatus(id: number | string, status: 'open' | 'closed'): Promise<StatusResult> {
+  return patchJSON<StatusResult>(`/api/items/${id}/status`, { status })
+}
+
+/** #42 DELETE /api/item-images/:id（JWT，**仅帖主本人**）。
+ *  这一条是**立刻生效**的：库里那行删了、磁盘文件也删了，和表单里其他字段保不保存无关。
+ *  所以调用它的地方（编辑页）要在点下去之前就说清这一点，而不是等用户回去才发现图没了。 */
+export function deleteItemImage(id: number): Promise<null> {
+  return deleteJSON<null>(`/api/item-images/${id}`)
 }

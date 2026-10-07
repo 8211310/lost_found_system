@@ -9,7 +9,7 @@
 // 所以这一页在未登录时也必须能完整渲染 —— 不要在这里放 RequireAuth。
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { getItem, unlockContact } from '../api/items'
+import { changeItemStatus, deleteItem, getItem, unlockContact } from '../api/items'
 import { errorText, requestIdOf } from '../api/errorText'
 import { useAuth } from '../auth/AuthContext'
 import { localMinute } from '../lib/time'
@@ -49,6 +49,12 @@ export default function ItemDetailPage() {
   const [unlockHint, setUnlockHint] = useState('')
   const [unlocking, setUnlocking] = useState(false)
   const [reportOpen, setReportOpen] = useState(false)
+
+  // 作者对自己这条帖的三个动作（#16 入口 / #18 开关 / #17 软删）。
+  const [ownerBusy, setOwnerBusy] = useState(false)
+  // 删除要两步：#17 是软删，帖子当场从广场消失，而**没有任何撤销端点**
+  // （恢复是 admin 的 #44，普通用户拿不到）。所以它不能是一个点了就走的按钮。
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
   useEffect(() => {
     let dead = false
@@ -100,6 +106,45 @@ export default function ItemDetailPage() {
     }
   }
 
+  async function toggleStatus() {
+    if (!item) return
+    // 目标状态取反：open → closed（「还回来了」），closed → open（还错了 / 又想重新挂出去）。
+    const next = item.status === 'open' ? 'closed' : 'open'
+    setOwnerBusy(true)
+    setError('')
+    try {
+      const res = await changeItemStatus(item.id, next)
+      // 这里**可以**用响应更新 state，而且只更新那一个字段：#18 的 data 就是 {id, status}，
+      // 后端刚刚写进库的就是它。和上面解锁那处不更新 item 不矛盾 ——
+      // 解锁的响应里根本没有 item 的新形状，只有一个 contact。
+      setItem({ ...item, status: res.status })
+    } catch (err) {
+      setError(errorText(err))
+      setErrorId(requestIdOf(err))
+    } finally {
+      setOwnerBusy(false)
+    }
+  }
+
+  async function removePost() {
+    if (!item) return
+    setOwnerBusy(true)
+    setError('')
+    try {
+      await deleteItem(item.id)
+      // 删完不回这条详情页：它的 status 已经是 deleted，留在原地只会让人以为没删掉。
+      // 广场也拿不到它了（#14 的 publicListStatus 拒绝 deleted），所以去处只有「我的发布」，
+      // 而那一页在片 4。现在能给的诚实去处就是广场。
+      navigate('/')
+    } catch (err) {
+      setError(errorText(err))
+      setErrorId(requestIdOf(err))
+      setConfirmDelete(false)
+    } finally {
+      setOwnerBusy(false)
+    }
+  }
+
   if (loading && !item) return <p className="muted">正在加载…</p>
 
   if (!item) {
@@ -121,6 +166,14 @@ export default function ItemDetailPage() {
   // #20 的鉴权是「本人或 Admin」（router.go 那段注释交代了为什么这里不用 OptionalJWT 给空列表）。
   // role 是每次请求现读数据库的（middleware/jwt.go），所以这里的 user.role 不可能是过期的 admin 身份。
   const canSeeMatches = status === 'authed' && (user?.role === 'admin' || user?.id === item.author.id)
+  // 作者操作只判本人，**不含 admin**：#18 后端写的就是「仅帖主，admin 也不行」
+  // （关一条帖子是「东西还回来了」这个社区表态，admin 能销毁内容但制造不出归属）。
+  // #16/#17 后端虽然允许 admin，但那条路要带 admin_reason，它的入口在管理后台（片 5），
+  // 所以这里对 admin 也不出现按钮 —— 不是做不到，是点下去只会吃一个他自己看不懂的 VALIDATION。
+  const isOwner = status === 'authed' && user?.id === item.author.id
+  // deleted 的帖子什么都不能再动：#16 在这种状态上返回 ITEM_CLOSED，
+  // #18 也一样。所以这一栏整块不出现，而不是给了按钮再报错。
+  const canAct = isOwner && item.status !== 'deleted'
 
   return (
     <>
@@ -216,6 +269,44 @@ export default function ItemDetailPage() {
           </p>
         )}
       </section>
+
+      {canAct && (
+        <section className="card owner-actions">
+          <h2>这条是你发的</h2>
+          <div className="owner-row">
+            <Link className="btn" to={`/items/${item.id}/edit`}>
+              修改
+            </Link>
+            {/* 文案跟着当前状态走而不是写死一个「关闭帖子」：
+                open 的人要的是「还回来了」，closed 的人要的是「重新挂出去」，
+                同一个按钮两种标题会让人按之前先犹豫一下。 */}
+            <button className="btn" type="button" disabled={ownerBusy} onClick={toggleStatus}>
+              {item.status === 'open' ? '标记为已归还' : '重新开放'}
+            </button>
+            {confirmDelete ? (
+              <button className="btn btn-danger" type="button" disabled={ownerBusy} onClick={removePost}>
+                确认删除
+              </button>
+            ) : (
+              <button className="link-btn" type="button" onClick={() => setConfirmDelete(true)}>
+                删除这条帖子
+              </button>
+            )}
+          </div>
+          {confirmDelete && (
+            <p className="hint">
+              删掉之后这条帖子在广场和搜索里就都没了，你自己也<strong>没有撤销</strong>的入口。
+              <button className="link-btn" type="button" onClick={() => setConfirmDelete(false)}>
+                取消
+              </button>
+            </p>
+          )}
+          <p className="hint">
+            「标记为已归还」只是把这条帖子的状态改掉，不给任何人加积分 ——
+            积分走的是另一条路：有人提交归还确认、你确认了才算。
+          </p>
+        </section>
+      )}
 
       {/* 匹配结果只有发帖人和 admin 读得到（#20 的鉴权是「本人或 Admin」），
           所以入口对其他人**根本不出现**，而不是点下去吃一个 FORBIDDEN。

@@ -105,6 +105,64 @@ export interface ImageView {
   sort_order: number
 }
 
+/** #6 POST /api/uploads 的 data —— 也是发帖时 image_paths 里该放的东西。
+ *
+ * ⚠ 提交给 #13/#16 的是 **path**，不是 url。后端 service.IsUploadPath 只对 path 那种
+ * `2026/10/<随机>.jpg` 形状做白名单，把 `/uploads/...` 原样传过去会被判 FILE 路径不合法。
+ * url 只用来显示（它由 baseURL + path 现拼，_item_images 里存的是 path_）。 */
+export interface StoredImage {
+  path: string
+  url: string
+}
+
+/** ItemFields —— #13 和 #16 共用的那 9 个字段，键名照抄 handler 那两个请求体。
+ *  时间一律 RFC3339：`<input type="datetime-local">` 给的是「2026-10-07T15:04」，
+ *  缺秒和时区，直接送后端会吃 VALIDATION（后端注释里明确拒绝宽容解析，见 lib/time.ts）。 */
+export interface ItemFields {
+  title: string
+  description: string
+  category_id: number
+  location_id: number
+  location_detail: string
+  last_seen_at: string
+  lost_at: string
+  found_at: string
+  contact: string
+}
+
+/** #13 POST /api/items 的请求体 = 那 9 个字段 + 类型 + 可选图片。 */
+export interface CreateItemPayload extends ItemFields {
+  item_type: 'lost' | 'found'
+  image_paths?: string[]
+}
+
+/** #16 PUT /api/items/:id 的请求体 = 同 #13 但**没有 item_type**（改帖不能改类型）。
+ *
+ * ⚠ image_paths 在这里是「整组替换」：字段缺失 = 不动图片，传 [] = 全删。
+ * 而 #15 的 ImageView 只有 {id,url,sort_order}，**不把 path 告诉前端**，
+ * 所以客户端无法重建「原有那几张 + 新加一张」这个完整集合 —— 一改就会把已有的图删掉。
+ * 结论：编辑模式一律不发这个字段，删单张走 #42（它认 id），加图只能重新发帖。 */
+export interface UpdateItemPayload extends ItemFields {
+  image_paths?: string[]
+  /** 仅 admin 改别人的帖子时必填；帖主改自己的什么都不用带。片 3 的入口只给帖主，所以不会出现。 */
+  admin_reason?: string
+}
+
+/** #13 的 data。两个键按 item_type **互斥**（service 里是指针 + omitempty）：
+ *  lost 只带 matches_preview（哪怕空数组也必须出现），found 只带 notified_count。
+ *  所以成功页该显示哪一套由「我刚发的是哪种帖」决定，不需要去猜响应里有没有某个键。 */
+export interface CreateItemResult {
+  item: ItemView
+  matches_preview?: MatchHit[]
+  notified_count?: number
+}
+
+/** #18 PATCH /api/items/:id/status 的 data。 */
+export interface StatusResult {
+  id: number
+  status: string
+}
+
 /** #15 GET /api/items/:id 的 data，也是 #13/#16 响应里 item 字段的形状。
  *
  * contact 是 `string | null` 而不是空串：后端用指针表示「锁着」，

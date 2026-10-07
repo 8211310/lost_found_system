@@ -30,6 +30,10 @@ interface Props {
    *  每层都有可见 label 而不是只给 aria-label：级联的「上一层选了谁」是
    *  这一层选项的来源，把它写在 label 上用户才知道第二个框为什么变了。 */
   firstLabel: string
+  /** 第一层那个「还没选」的选项写什么。广场上是筛选，不选就是「不限」；
+   *  发布表单里分类和地点是必填项，那里得写「请选择」——
+   *  一个必填框显示着「不限」，用户会以为自己已经做了选择。 */
+  firstPlaceholder?: string
   onChange: (leafId?: number) => void
 }
 
@@ -43,7 +47,14 @@ function findPath(tree: CascaderNode[], leafId: number): CascaderNode[] {
   return []
 }
 
-export default function DictCascader({ idPrefix, tree, value, firstLabel, onChange }: Props) {
+export default function DictCascader({
+  idPrefix,
+  tree,
+  value,
+  firstLabel,
+  firstPlaceholder = '不限',
+  onChange,
+}: Props) {
   // 选中路径是**内部状态**，不是 value 的派生值。这一点被测试逼出来的，理由值得留着：
   // 用户选完大类时组件发出去的是 undefined（大类不是值），如果路径也从 value 派生，
   // 那这一次 undefined 会立刻把刚选的大类抹掉 —— 第二个下拉框闪一下就没了，
@@ -106,8 +117,9 @@ export default function DictCascader({ idPrefix, tree, value, firstLabel, onChan
                   少了它，浏览器会把**第一个真实选项**显示成已选中 ——
                   框里写着「背包书包」、下面的结果却一条都没筛，
                   而「只有叶子才产生 value」这条规则恰恰意味着中间层本来就没有选中值。
-                  第一层叫「不限」（它是终点），更深的层叫「请选择」（它只是还没走完）。 */}
-              <option value="">{i === 0 ? '不限' : '请选择'}</option>
+                  第一层默认叫「不限」（筛选场景里它就是个有效结论），必填场景由调用方改成「请选择」；
+                  更深的层一律叫「请选择」，因为它只是还没走完，不是一个答案。 */}
+              <option value="">{i === 0 ? firstPlaceholder : '请选择'}</option>
               {options.map((n) => (
                 <option key={n.id} value={n.id}>
                   {n.name}
