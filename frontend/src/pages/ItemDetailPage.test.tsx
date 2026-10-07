@@ -194,21 +194,26 @@ describe('发帖人本人', () => {
     mockMe(sampleUser({ id: 8 }))
     mockDetail(sampleItemView({ author: { id: 8, nickname: '小王' }, contact: '微信 bbb', contact_locked: false }))
 
+    // 分数全部按 matcher 的公式自己算出来，不是随手写的数：
+    //   文本 0.5×标题 0.6 + 0.5×描述 0.4 = 0.5000（textScore 就是两个 dice 各占一半）
+    //   地点走 detail_text 那一档 = 0.4（文字折扣）× 0.6 = 0.2400
+    //   总分 0.35×1 + 0.30×0.5000 + 0.20×1 + 0.15×0.2400 = 0.7360
+    // 四格的加权互不相同，所以下面的 getByText 每条都只可能落在它自己那一格上。
     const res: MatchResult = {
       tier: 2,
       notice: '这条帖子选了「其他」，地点无法按叶子比较，只能走宽松匹配。',
       list: [
         {
           item: sampleSummary({ id: 303, item_type: 'lost', title: '我的黑色钱包丢了' }),
-          score: 0.7537,
+          score: 0.736,
           breakdown: {
-            score: 0.7537,
+            score: 0.736,
             tier: 2,
             signals: {
               category: { weight: 0.35, score: 1, same_leaf: true },
-              text: { weight: 0.3, score: 0.5123, title_dice: 0.6, desc_dice: 0.4 },
+              text: { weight: 0.3, score: 0.5, title_dice: 0.6, desc_dice: 0.4 },
               time: { weight: 0.2, score: 1, in_loss_window: true, days_after_lost_at: 0 },
-              location: { weight: 0.15, score: 0.3333, matched_by: 'detail_text' },
+              location: { weight: 0.15, score: 0.24, matched_by: 'detail_text' },
             },
           },
         },
@@ -225,17 +230,19 @@ describe('发帖人本人', () => {
     expect(screen.getByText(/只能走宽松匹配/)).toBeInTheDocument()
 
     // 三列都在（这是「调试器」而不是「百分比」）。加权那一列是验算的落点：
-    // 0.35×1 + 0.30×0.5123 + 0.20×1 + 0.15×0.3333 = 0.3500 + 0.1537 + 0.2000 + 0.0500 = 0.7537，
+    // 0.35×1 + 0.30×0.5000 + 0.20×1 + 0.15×0.2400 = 0.3500 + 0.1500 + 0.2000 + 0.0360 = 0.7360，
     // 和后端返回的总分对上（夹具就是按这个和配平的，所以这条断言真的在验算而不是摆设）。
     // 「加权」这一列是前端把后端给的两个数**相乘**显示出来 —— 只有乘法，没有第二个公式；
     // 总分那一列则一律用后端的，不自己相加。
     expect(screen.getByRole('columnheader', { name: '权重' })).toBeInTheDocument()
     expect(screen.getByRole('columnheader', { name: '加权' })).toBeInTheDocument()
     expect(screen.getByText('0.35')).toBeInTheDocument()
-    expect(screen.getByText('0.5123')).toBeInTheDocument()
-    expect(screen.getByText('0.1537')).toBeInTheDocument()
-    expect(screen.getByText('0.0500')).toBeInTheDocument()
-    expect(screen.getByText(/总分 0\.7537（Tier 2）/)).toBeInTheDocument()
+    expect(screen.getByText('0.5000')).toBeInTheDocument()
+    expect(screen.getByText('0.3500')).toBeInTheDocument()
+    expect(screen.getByText('0.1500')).toBeInTheDocument()
+    expect(screen.getByText('0.2000')).toBeInTheDocument()
+    expect(screen.getByText('0.0360')).toBeInTheDocument()
+    expect(screen.getByText(/总分 0\.7360（Tier 2）/)).toBeInTheDocument()
     expect(screen.getByText('靠「具体位置」那段文字匹配上')).toBeInTheDocument()
   })
 
