@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -43,52 +44,101 @@ func JWT(signer auth.TokenSigner, users UserByID) gin.HandlerFunc {
 			return
 		}
 
-		userID, err := signer.Parse(raw)
+		u, err := resolveUser(c.Request.Context(), signer, users, raw)
 		if err != nil {
-			// Parse 已经把内部原因包在 apperr.Error.Err 里，访问日志会打出来，
-			// 但响应体只有「登录已过期」/「凭证无效」这类通用文案（§8）。
+			// 错误里已经区分好了三种情况的文案，且内部原因包在 apperr.Error.Err 里 ——
+			// 访问日志会打出来，但响应体只有「登录已过期」这类通用文案（§8）。
 			reject(c, err)
 			return
 		}
 
-		u, err := users.GetByID(c.Request.Context(), userID)
-		if err != nil {
-			if apperr.IsCode(err, apperr.CodeNotFound) {
-				// token 签名有效，但对应的用户已经不在库里了。
-				// 现实成因：admin 从 Adminer 里删了这行（§3.4 允许），或者测试库被 truncate 过。
-				// 对用户表现为 401 让他重新登录，比 500 合理 —— 他确实没有有效身份了。
-				reject(c, apperr.WrapMsg(err, apperr.CodeUnauthorized, "账号不存在，请重新登录"))
-				return
-			}
-			// 数据库故障 → 让 apperr.Respond 转成 INTERNAL 500。
-			// 绝不能伪装成 401：那会把一次宕机表现成「所有人都登录失效」，
-			// 排查时会去查 JWT 密钥是不是换了，而真正的原因是连接断了。
-			reject(c, err)
-			return
-		}
-
-		// 封禁拦截。§8 对 USER_BANNED 的定义是「被封禁用户登录/**操作**」——
-		// 登录那一半在 auth.LocalProvider 里，操作这一半就在这里。
-		// 少了这里，admin 封号之后那个人手上的旧 token 还能继续发帖、删帖、解锁联系方式。
-		if u.IsBanned() {
-			reject(c, apperr.NewMsg(apperr.CodeUserBanned, "账号已被封禁，请联系管理员"))
-			return
-		}
-
-		apperr.SetUserID(c, u.ID)
-		apperr.SetUser(c, u)
-
-		// ⚠ 这里**不要**把 user_id 再预绑定进 logger（apperr.SetLogger(c, log.With(...))）。
-		// AccessLog 已经把 user_id 作为一个显式字段打进 http.request 那行了，
-		// 而它在 c.Next() 之后才执行，那时 UserID(c) 已经被上面这行设好。
-		// 再绑定一次会让同一条日志里出现两个 user_id 键 —— 这正是 accesslog.go
-		// 里对 request_id 特别注明「不在这里写，因为已经预绑定过了」的同一个坑。
-		//
-		// 业务日志（比如 service 里的 auth.login）需要 user_id 时自己显式带上，
-		// 那样每条日志的字段是写出来的、看得见的，不依赖中间件的绑定顺序。
-
+		setIdentity(c, u)
 		c.Next()
 	}
+}
+
+// OptionalJWT 是「认得出身份就认，认不出就当匿名」的 JWT 中间件。
+//
+// 存在它的唯一理由是 #15 GET /api/items/:id：那是个**公开**接口（帖子内容对未登录
+// 用户完全公开，§2.4），但 contact 的可见性规则里有「当前用户是发帖人」和
+// 「已解锁过」两个分支，所以它必须知道「现在是谁在看」。
+//
+// ⚠ 任何失败都**不返回 401**，包括 token 过期、签名不对、用户被封、用户已被删。
+// 公开接口因为一个过期 token 而拒绝服务是荒谬的 —— 用户该看到的是帖子内容
+// 和一个「登录后查看联系方式」的按钮，而不是一句「请先登录」然后被踢去登录页。
+// 最坏的结果只是他看不到 contact，而这恰好就是未登录用户本该得到的结果。
+//
+// 失败时记一条 debug 日志而不是彻底静默：前端报「我明明登录了怎么还让我解锁」
+// 这类问题时，那条日志是唯一能区分「token 真过期了」和「前端忘了带头」的证据。
+func OptionalJWT(signer auth.TokenSigner, users UserByID) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, ok := bearerToken(c)
+		if !ok {
+			c.Next()
+			return
+		}
+
+		u, err := resolveUser(c.Request.Context(), signer, users, raw)
+		if err != nil {
+			apperr.Log(c).DebugContext(c.Request.Context(), "auth.optional_ignored",
+				slog.String("path", c.Request.URL.Path),
+				slog.String("err", err.Error()))
+			c.Next()
+			return
+		}
+
+		setIdentity(c, u)
+		c.Next()
+	}
+}
+
+// resolveUser 把 token 换成一行 users，是两个 JWT 中间件共用的那一段。
+//
+// 抽出来不只是省重复：这两条路径对「身份」的定义必须是**同一个**，
+// 否则就会出现「带这个 token 能发帖但不能看详情页的联系方式」这种自相矛盾的行为，
+// 而那种 bug 从现象往回查到「原来两个中间件各写了一遍判断」要花很久。
+func resolveUser(ctx context.Context, signer auth.TokenSigner, users UserByID, raw string) (*model.User, error) {
+	userID, err := signer.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := users.GetByID(ctx, userID)
+	if err != nil {
+		if apperr.IsCode(err, apperr.CodeNotFound) {
+			// token 签名有效，但对应的用户已经不在库里了。
+			// 现实成因：admin 从 Adminer 里删了这行（§3.4 允许），或者测试库被 truncate 过。
+			// 对用户表现为 401 让他重新登录，比 500 合理 —— 他确实没有有效身份了。
+			return nil, apperr.WrapMsg(err, apperr.CodeUnauthorized, "账号不存在，请重新登录")
+		}
+		// 数据库故障 → 让 apperr.Respond 转成 INTERNAL 500。
+		// 绝不能伪装成 401：那会把一次宕机表现成「所有人都登录失效」，
+		// 排查时会去查 JWT 密钥是不是换了，而真正的原因是连接断了。
+		return nil, err
+	}
+
+	// 封禁拦截。§8 对 USER_BANNED 的定义是「被封禁用户登录/**操作**」——
+	// 登录那一半在 auth.LocalProvider 里，操作这一半就在这里。
+	// 少了这里，admin 封号之后那个人手上的旧 token 还能继续发帖、删帖、解锁联系方式。
+	if u.IsBanned() {
+		return nil, apperr.NewMsg(apperr.CodeUserBanned, "账号已被封禁，请联系管理员")
+	}
+	return u, nil
+}
+
+// setIdentity 把认出来的用户塞进 context。
+//
+// ⚠ 这里**不要**把 user_id 再预绑定进 logger（apperr.SetLogger(c, log.With(...))）。
+// AccessLog 已经把 user_id 作为一个显式字段打进 http.request 那行了，
+// 而它在 c.Next() 之后才执行，那时 UserID(c) 已经被下面这两行设好。
+// 再绑定一次会让同一条日志里出现两个 user_id 键 —— 这正是 accesslog.go
+// 里对 request_id 特别注明「不在这里写，因为已经预绑定过了」的同一个坑。
+//
+// 业务日志（比如 service 里的 item.create）需要 user_id 时自己显式带上，
+// 那样每条日志的字段是写出来的、看得见的，不依赖中间件的绑定顺序。
+func setIdentity(c *gin.Context, u *model.User) {
+	apperr.SetUserID(c, u.ID)
+	apperr.SetUser(c, u)
 }
 
 // bearerToken 从 Authorization 头里取出 token。

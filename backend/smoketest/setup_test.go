@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -50,10 +51,10 @@ func TestMain(m *testing.M) {
  集成测试被要求必须运行（REQUIRE_INTEGRATION=1），但 TEST_DB_DSN 是空的。
  这是失败，不是跳过 —— 否则「全绿」可能意味着一条集成测试都没跑。
 
- 先确认 docker compose up -d 已经起了 postgres，然后：
+ 先确认 PostgreSQL 服务在跑（scripts/setup-postgres.sh 起过的那个），然后：
 
    cd backend
-   TEST_DB_DSN="postgres://lf:lf@localhost:5432/postgres?sslmode=disable" \
+   TEST_DB_DSN="postgres://lf:lf@127.0.0.1:5432/postgres?sslmode=disable" \
    REQUIRE_INTEGRATION=1 go test ./...
 
  注意 DSN 指向的是维护库 postgres，测试代码会自己创建并使用 lostfound_test。
@@ -68,9 +69,8 @@ func TestMain(m *testing.M) {
  这不算失败（纯单元测试仍然会跑），但也不代表功能被验证过。
 
  要真正跑集成测试：
-   docker compose up -d
    cd backend
-   TEST_DB_DSN="postgres://lf:lf@localhost:5432/postgres?sslmode=disable" go test ./...
+   TEST_DB_DSN="postgres://lf:lf@127.0.0.1:5432/postgres?sslmode=disable" go test ./...
 --------------------------------------------------------------------------------
 `)
 		os.Exit(0)
@@ -122,13 +122,25 @@ func setup(dsn string) (*Harness, error) {
 
 	gin.SetMode(gin.TestMode) // 否则 gin 会把路由表打进测试输出，淹没真正的失败信息
 
+	// 图片目录必须是**临时的**：M2 起 #6 上传会真的往磁盘写文件，
+	// 而 TruncateAll 只清数据库、不清磁盘。指向仓库里的 ./uploads 的话，
+	// 每跑一次测试就多几十个垃圾文件，而且「删帖时磁盘文件消失」这条断言
+	// 会被上一次跑剩的同名文件干扰。
+	uploadDir, err := os.MkdirTemp("", "lostfound-smoketest-uploads-")
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("建临时上传目录失败: %w", err)
+	}
+
 	// cfg 必须是**能通过 Setup 内部校验**的：M1 起 Setup 会真的 new 一个
 	// auth.TokenSigner，它拒绝空密钥和非正有效期。
 	// 密钥只活在这个测试进程里，和任何环境的真密钥无关。
 	cfg := config.Config{
-		Env:       "test",
-		JWTSecret: "smoketest-secret-0123456789abcdef0123456789abcdef",
-		JWTExpire: time.Hour,
+		Env:           "test",
+		JWTSecret:     "smoketest-secret-0123456789abcdef0123456789abcdef",
+		JWTExpire:     time.Hour,
+		UploadDir:     uploadDir,
+		UploadBaseURL: "/uploads",
 	}
 
 	engine, err := router.Setup(cfg, pool)
@@ -146,8 +158,8 @@ func setup(dsn string) (*Harness, error) {
 
 // ensureTestDatabase 用 Go 代码建库。
 //
-// 为什么不用 createdb 命令：本机没有安装任何 postgres 客户端工具（§1.2），
-// 唯一能连上数据库的东西就是我们自己程序里的 pgx。所以建库也只能自己来。
+// 为什么不直接调 createdb：本机（scoop 装的 PostgreSQL）的 bin 目录不在 PATH 上，
+// 测试不该依赖调用方的 shell 环境。而 pgx 本来就连着库，建库也就一句 SQL 的事。
 func ensureTestDatabase(ctx context.Context, dsn string) error {
 	// 先连到 DSN 里写的那个库（通常是 postgres 维护库），因为 CREATE DATABASE
 	// 不能连着「正要被创建的那个库」执行
@@ -187,6 +199,11 @@ type Harness struct {
 func (h *Harness) Close() {
 	h.Server.Close()
 	h.Pool.Close()
+	// 临时上传目录是我们自己建的，自己删干净 —— 否则每跑一次测试
+	// 就在系统临时目录里留一个装满假图片的文件夹。
+	if h.Cfg.UploadDir != "" {
+		_ = os.RemoveAll(h.Cfg.UploadDir)
+	}
 }
 
 // TruncateAll 清空全部业务表并重置自增 id，让每个测试从干净状态开始、测试之间零串扰。
@@ -268,61 +285,25 @@ func (r Response) DataInto(t *testing.T, v any) {
 	}
 }
 
-// Do 发一个请求并解信封。body 为 nil 时不带请求体；token 非空时加 Authorization 头。
+// Do 发一个 JSON 请求并解信封。body 为 nil 时不带请求体；token 非空时加 Authorization 头。
+//
+// 真正的发送/收信/解信封都在 doRaw 里 —— PostMultipart 也走它。
+// 拆开的理由和 bindJSON/bindJSONOptional 一样：「一个响应长什么样」只能有一份定义，
+// 两份的话其中一份改了另一份不会跟着改，而测试照样全绿。
 func (h *Harness) Do(t *testing.T, method, path string, body any, token string) Response {
 	t.Helper()
 
 	var reader io.Reader
+	var contentType string
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
 			t.Fatalf("序列化请求体失败: %v", err)
 		}
 		reader = bytes.NewReader(raw)
+		contentType = "application/json"
 	}
-
-	req, err := http.NewRequest(method, h.Server.URL+path, reader)
-	if err != nil {
-		t.Fatalf("构造请求失败: %v", err)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := h.Server.Client().Do(req)
-	if err != nil {
-		t.Fatalf("%s %s 请求失败: %v", method, path, err)
-	}
-	defer resp.Body.Close()
-
-	rawBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("读取响应体失败: %v", err)
-	}
-
-	var env struct {
-		Code      string          `json:"code"`
-		Message   string          `json:"message"`
-		Data      json.RawMessage `json:"data"`
-		RequestID string          `json:"request_id"`
-	}
-	// 信封解不开就是契约被破坏了 —— 这时候必须把原始响应体打出来，否则没法定位
-	if err := json.Unmarshal(rawBody, &env); err != nil {
-		t.Fatalf("%s %s 返回的不是统一信封（§8 被破坏了？）: %v\nHTTP %d\n原始响应: %s",
-			method, path, err, resp.StatusCode, truncate(string(rawBody)))
-	}
-
-	return Response{
-		HTTPStatus: resp.StatusCode,
-		Code:       env.Code,
-		Message:    env.Message,
-		RequestID:  env.RequestID,
-		Data:       env.Data,
-		Header:     resp.Header,
-	}
+	return h.doRaw(t, method, path, reader, contentType, token, true)
 }
 
 // Get / Post 是两个最常用的快捷方式。
@@ -449,4 +430,128 @@ func truncate(s string) string {
 		return s
 	}
 	return s[:max] + fmt.Sprintf("...(截断，共 %d 字节)", len(s))
+}
+
+// ---------- 非 JSON 的请求与响应 ----------
+
+// PostMultipart 发一个 multipart/form-data 请求，专门给 #6 上传用。
+//
+// 不能复用 Do：Do 只会 marshal 成 JSON，而上传的契约（表单字段名必须叫 file、
+// Content-Type 必须是 multipart/form-data 带 boundary）恰恰是 JSON 请求表达不出来的。
+// 响应仍然是 §8 的信封，所以这里照旧解信封。
+func (h *Harness) PostMultipart(t *testing.T, path, field, filename string, content []byte, token string) Response {
+	t.Helper()
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	part, err := w.CreateFormFile(field, filename)
+	if err != nil {
+		t.Fatalf("构造 multipart 失败: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("写入文件内容失败: %v", err)
+	}
+	if err := w.Close(); err != nil { // Close 才会写出结尾的 boundary，漏了服务端解析不出来
+		t.Fatalf("结束 multipart 失败: %v", err)
+	}
+
+	return h.doRaw(t, http.MethodPost, path, &buf, w.FormDataContentType(), token, true)
+}
+
+// GetRaw 发一个 GET 并返回**未解析**的响应，给 #40 静态文件用。
+//
+// #40 是全部 50 个端点里唯一一个不走 JSON 信封的（它直接返回图片二进制），
+// 所以它不能用 Do —— Do 解不开信封就会 fatal。
+func (h *Harness) GetRaw(t *testing.T, path, token string) (int, []byte, http.Header) {
+	t.Helper()
+	r := h.doRaw(t, http.MethodGet, path, nil, "", token, false)
+	return r.HTTPStatus, r.Data, r.Header
+}
+
+// doRaw 是 Do 和 PostMultipart 共用的底层：发请求 → 读响应 → 解信封。
+// envelope 为 false 时跳过解信封（调用方自己处理 body）。
+func (h *Harness) doRaw(t *testing.T, method, path string, body io.Reader, contentType, token string, envelope bool) Response {
+	t.Helper()
+
+	req, err := http.NewRequest(method, h.Server.URL+path, body)
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := h.Server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("%s %s 请求失败: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	rawBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取响应体失败: %v", err)
+	}
+
+	out := Response{
+		HTTPStatus: resp.StatusCode,
+		Data:       rawBody,
+		Header:     resp.Header,
+	}
+	if !envelope {
+		return out
+	}
+
+	var env struct {
+		Code      string          `json:"code"`
+		Message   string          `json:"message"`
+		Data      json.RawMessage `json:"data"`
+		RequestID string          `json:"request_id"`
+	}
+	if err := json.Unmarshal(rawBody, &env); err != nil {
+		t.Fatalf("%s %s 返回的不是统一信封（§8 被破坏了？）: %v\nHTTP %d\n原始响应: %s",
+			method, path, err, resp.StatusCode, truncate(string(rawBody)))
+	}
+	out.Code = env.Code
+	out.Message = env.Message
+	out.Data = env.Data
+	out.RequestID = env.RequestID
+	return out
+}
+
+// ---------- 改库夹具 ----------
+
+// MakeAdmin 把一个已存在的用户提升为 admin，返回带**新 token** 的登录态。
+//
+// 计划里没有「注册成 admin」的端点（也不该有），所以只能直接改库。
+// 改完之后必须重新铸 token：不是因为 role 在 claims 里 —— 恰恰相反，
+// M1 那个设计决定就是「role/status 不进 JWT」，中间件每个请求都回库查一次。
+// 这里重铸只是为了让返回值自洽（Role 字段是新的），旧 token 其实照样能用。
+func (h *Harness) MakeAdmin(t *testing.T, s Session) Session {
+	t.Helper()
+	if _, err := h.Pool.Exec(context.Background(),
+		`UPDATE users SET role = 'admin', updated_at = now() WHERE id = $1`, s.UserID); err != nil {
+		t.Fatalf("提升 admin 失败: %v", err)
+	}
+	s.Role = "admin"
+	s.Token = h.TokenFor(t, s.UserID)
+	return s
+}
+
+// SetItemStatus 直接把一条帖子改成某个状态。
+//
+// 用它而不是走 #18：#18 只允许 open/closed，而很多测试需要一条 deleted 的帖子
+// 来验「软删之后广场看不见、本人和管理员还能看见」。
+func (h *Harness) SetItemStatus(t *testing.T, itemID int64, status string) {
+	t.Helper()
+	tag, err := h.Pool.Exec(context.Background(),
+		`UPDATE items SET status = $2, updated_at = now() WHERE id = $1`, itemID, status)
+	if err != nil {
+		t.Fatalf("改帖子 %d 的状态失败: %v", itemID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("改帖子 %d 的状态影响了 %d 行，期望 1 行", itemID, tag.RowsAffected())
+	}
 }

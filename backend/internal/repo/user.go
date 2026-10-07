@@ -17,12 +17,6 @@ import (
 	"lostfound/internal/model"
 )
 
-// pgUniqueViolation 是 PostgreSQL 的 unique_violation 错误码。
-//
-// 为什么按码判断而不是按错误文本：文本会随 PG 版本和 locale 变化，码是稳定的。
-// 这条纪律和 §7.6 里「匹配杭电助手错误按 error/code 判断，不按 msg」是同一条。
-const pgUniqueViolation = "23505"
-
 // userCols 是 users 表的取列清单。
 //
 // 抽成一个常量而不是每条 SQL 各写一遍：SELECT 的列顺序必须和 scanUser 里的

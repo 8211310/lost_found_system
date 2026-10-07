@@ -1,9 +1,6 @@
 package handler
 
 import (
-	"encoding/json"
-	"errors"
-
 	"github.com/gin-gonic/gin"
 
 	"lostfound/internal/apperr"
@@ -154,37 +151,4 @@ func (h Auth) ChangePassword(c *gin.Context) {
 		return
 	}
 	apperr.OK(c, nil)
-}
-
-// ---------- 辅助 ----------
-
-// bindJSON 把请求体解析进 dst，失败时返回带字段级细节的 VALIDATION。
-//
-// 单独抽出来是因为 #1/#2/#4/#5 四个端点都要做同一件事，而「解析失败长什么样」
-// 必须是统一的 —— 前端只有一个 axios 拦截器，它按 code 分支，
-// 如果有的接口返回 VALIDATION、有的返回 INTERNAL，前端就得多写一套特例。
-//
-// 特别处理 UnmarshalTypeError：用户传 {"username": 123} 时，
-// 一句「请求体不是合法的 JSON」是没用的（JSON 本身完全合法），
-// 得告诉他「username 的类型不对」。te.Field 就是 json 标签里的名字，可以直接用。
-func bindJSON(c *gin.Context, dst any) error {
-	err := c.ShouldBindJSON(dst)
-	if err == nil {
-		return nil
-	}
-
-	var te *json.UnmarshalTypeError
-	if errors.As(err, &te) {
-		field := te.Field
-		if field == "" {
-			field = "(未知字段)"
-		}
-		return apperr.Validation("字段类型不对",
-			apperr.FieldError{Field: field, Msg: "类型不对，期望的是 " + te.Type.String()})
-	}
-
-	// 到这里通常是 JSON 语法错误、body 为空、或 Content-Type 不对。
-	// 原始错误只进日志（apperr.Respond 会把它交给访问日志），
-	// 响应里给一句人能看懂的中文 —— 语法错误的细节对最终用户毫无意义。
-	return apperr.WrapMsg(err, apperr.CodeValidation, "请求体不是合法的 JSON")
 }

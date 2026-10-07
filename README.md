@@ -182,6 +182,15 @@ bash scripts/smoke.sh
 它用 curl 打一遍全链路，只断言 `code` 字段，**从不断言 message 文本**
 （message 是给人看的中文，随时可改；code 是稳定的机器码，永不改语义）。
 
+有几条判据在接口上看不出来，必须直接查库 —— 比如「校验失败了却还是把帖子插进去」：
+每条错误码都对，但库里已经堆了一堆不该存在的行。这些步骤会自己找本机 psql：
+
+```bash
+/d/Scoop/apps/postgresql/current/bin/psql.exe   # scoop 的原生安装不在 PATH 上
+```
+
+找不到就 SKIP（不算 FAIL，也不算 PASS —— 那样「全绿」会悄悄少测几条判据）。
+
 ---
 
 ## 调试
@@ -258,7 +267,34 @@ bash scripts/smoke.sh
   另外实测了两条安全性质：账号枚举的**计时**侧信道已抹平（用户名不存在 48.0ms
   vs 密码错 48.0ms，靠 dummy bcrypt 比对补齐），**响应与日志**两条路径也同形
   （同 code、同 message、访问日志里同样不带 `err` 字段）。
-- **未开工**：M2 字典·物品·上传 · M3 匹配 · M4 解锁·通知·举报 ·
+- **M2 字典·物品·上传 —— 已完成并验收（2026-10-07）**
+  §4 的 #6–#8、#13–#19、#40、#42 共 12 条新路由（累计 18 条 / 最终 50 条）：
+  图片上传（`crypto/rand` 文件名 + magic bytes 嗅探，**不看扩展名和 Content-Type**）、
+  静态文件服务、分类/地点两棵只读字典树、发帖 / 广场分页筛选 / 详情（`OptionalJWT`）/
+  改帖 / 软删 / 关帖 / 我的发布 / **帖主自删单张图片**。
+  验收实测：纯单测（不连库）auth 59 + middleware 15 + router 7 + service 239 +
+  repo 42 + model 5 = **367 项全绿**；集成测试 `smoketest` **350 项全绿**
+  （106 个顶层测试函数）；`scripts/smoke.sh` **197 项全绿、0 跳过**。
+  几条只有测了才成立的性质：
+  - `contact` **只校验非空，不校验内容** —— 空串、纯半角空格、全角空格 `U+3000` 都得
+    `VALIDATION`；填「无」「问宿舍阿姨」都返回成功。这是原则 2 的正面证据，
+    只测拒绝不测接受的话，「把所有 contact 都拒掉」的实现也能全绿。
+  - 时间语义由 **DB 的 `CHECK`** 兜底：`last_seen_at > lost_at` 和「found 帖填了
+    `last_seen_at`」两条，既在 API 层测了 `VALIDATION`，也绕过 service 直接 `INSERT`
+    测了 SQLSTATE 23514 + 约束名 `items_time_semantics`。
+    CHECK 守的是那些不经过我们代码的写入（pgAdmin 手改、将来的迁移），没测过的防线
+    和没有防线看不出区别。
+  - `found` 帖的 `contact` 在**广场和详情页都是 `null`**，包括作者本人看自己的 ——
+    #14/#15 因此不需要身份，可以缓存。想看自己的联系方式只有 #19。
+  - #19 的 `user_id` 来自 JWT，**不是查询参数**；`?user_id=别人` 会被忽略。
+  - `keyword` 走 `ILIKE ... ESCAPE '\'`，搜 `100%` 时那个 `%` 是字面量。
+  - `sort` 过两张白名单（service 决定用户能请求什么，repo 决定什么能拼进 SQL），
+    `sort=created_at;DROP TABLE items` 得 `VALIDATION` 而不是 `500`。
+  - #42 只有**帖主本人**能删，别人和 **admin** 都得 `FORBIDDEN`（admin 删图是 #45）。
+    删完 `item_images` 少一行、磁盘文件消失、帖子和其余图片都在，
+    封面由 #14 的 `LEFT JOIN LATERAL ... ORDER BY sort_order LIMIT 1` 现算，不需要「重算封面」的代码。
+  - admin 改别人的帖**必须带 `admin_reason`**，且改不动作者 —— 归属是改不了的（原则 5）。
+- **未开工**：M3 匹配 · M4 解锁·通知·举报 ·
   M5 归还确认·积分 · M6 治理与管理后台 · M7 前端 · M8 杭电助手 SSO（外部阻塞中）
 
 路由清单见 `internal/router/router.go` —— 那是 §4 全部 50 条路由的唯一注册点，
@@ -313,6 +349,14 @@ printf '%s' '{"nickname":"冒烟"}' | curl -X POST .../api/auth/register --data-
 以后手写 curl 命令测中文时记得这一点，否则会误判成「后端不支持 UTF-8」。
 顺带一个判据：**响应里的**中文一直是好的（stdout 不做这次转换），
 所以「发出去变问号、收回来正常」这个组合就是 argv 的锅，不是数据库编码的锅。
+
+**同一条坑还有三个变种**，都在这台机器上实测过：
+
+| 中招的位置 | 症状 | 对策 |
+|---|---|---|
+| URL 里的查询参数（`?keyword=冒烟`） | 中文变 `???`，筛选「查不到」—— 而且**搜不到时的断言会假绿** | 冒烟脚本里一律先百分号编码 |
+| `psql -c "…'中文'…"` | 写进库的是 `???`，或按中文匹配永远 0 行 | 脚本里的库级断言只数行数（`count(*)`），不比对中文字面量 |
+| `curl -o 输出文件`（本仓库路径含中文） | 文件根本没被写出来，后续 `head` 报 no such file | 临时文件放 `mktemp -d`（纯 ASCII 路径） |
 
 **Go 版本是 1.26.0，计划 §1.2 写的是 1.25.4。** 这是 `GOTOOLCHAIN=auto` 的正常行为：
 scoop 装的是 go 1.25.4，但依赖里 `golang.org/x/text v0.42.0` 要求 `go >= 1.26.0`，

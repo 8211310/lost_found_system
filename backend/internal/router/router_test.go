@@ -1,6 +1,7 @@
 package router
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -22,6 +23,18 @@ var expectedRoutes = []string{
 	"GET /api/auth/me",               // #3
 	"PUT /api/auth/me",               // #4
 	"POST /api/auth/change-password", // #5
+	"POST /api/uploads",              // #6
+	"GET /api/categories",            // #7
+	"GET /api/locations",             // #8
+	"POST /api/items",                // #13
+	"GET /api/items",                 // #14
+	"GET /api/items/:id",             // #15
+	"PUT /api/items/:id",             // #16
+	"DELETE /api/items/:id",          // #17
+	"PATCH /api/items/:id/status",    // #18
+	"GET /api/my/items",              // #19
+	"GET /uploads/*filepath",         // #40
+	"DELETE /api/item-images/:id",    // #42
 }
 
 // testConfig 给 Setup 一份**能通过校验**的最小配置。
@@ -30,11 +43,18 @@ var expectedRoutes = []string{
 // 而它拒绝空密钥和非正的有效期（这是启动期就该拦住的配置错误，见 jwt.go）。
 // 这里的密钥只存在于测试进程内，不是任何环境的真密钥 —— 但刻意写满 32 字节以上，
 // 免得将来有人复制这一行去当 .env 的模板。
-func testConfig() config.Config {
+//
+// M2 起还需要 UploadDir：NewUpload 会 MkdirAll，留空的话它会落到「当前工作目录」
+// （也就是 internal/router/），于是跑一次测试就在源码树里留下一个 uploads 目录。
+// t.TempDir() 由测试框架自动清理，而且每个测试各自一份，互不干扰。
+func testConfig(t *testing.T) config.Config {
+	t.Helper()
 	return config.Config{
-		Env:       "test",
-		JWTSecret: "router-test-secret-0123456789abcdef0123456789abcdef",
-		JWTExpire: time.Hour,
+		Env:           "test",
+		JWTSecret:     "router-test-secret-0123456789abcdef0123456789abcdef",
+		JWTExpire:     time.Hour,
+		UploadDir:     t.TempDir(),
+		UploadBaseURL: "/uploads",
 	}
 }
 
@@ -51,7 +71,7 @@ func TestSetupRegistersExactlyTheExpectedRoutes(t *testing.T) {
 	// repo.NewUser(nil) 只是把 nil 存进结构体，不建连接；auth.NewLocalProvider
 	// 也只在 Authenticate 时才碰库。这也是这条测试不需要数据库的原因 ——
 	// 它属于 §10 的第①层（纯单元测试）。
-	e, err := Setup(testConfig(), nil)
+	e, err := Setup(testConfig(t), nil)
 	if err != nil {
 		t.Fatalf("Setup 返回了 error：%v", err)
 	}
@@ -66,7 +86,15 @@ func TestSetupRegistersExactlyTheExpectedRoutes(t *testing.T) {
 
 	got := make(map[string]int)
 	for _, r := range e.Routes() {
-		got[r.Method+" "+r.Path]++
+		key := r.Method + " " + r.Path
+		// gin 的 Static() 会**自动**给同一条路径再注册一个 HEAD
+		// （HEAD 的语义就是「GET 但不要 body」，浏览器和图片预加载会用到）。
+		// 那不是我们写的路由，所以不算进 §4 的 50 条 —— 但它必须有一条对应的 GET，
+		// 否则就是「凭空多出一个 HEAD」，那才是要报出来的。
+		if r.Method == http.MethodHead && want["GET "+r.Path] {
+			continue
+		}
+		got[key]++
 	}
 
 	for key, n := range got {
@@ -87,7 +115,7 @@ func TestSetupRegistersExactlyTheExpectedRoutes(t *testing.T) {
 // TestFinalRouteCount 是计划 §10 那条「断言条数 == 50」的落点。
 func TestFinalRouteCount(t *testing.T) {
 	if !planComplete {
-		t.Skip("M0 只有 1 条路由；M6 收尾时把本文件的 planComplete 改成 true，这条测试就会开始要求 50 条")
+		t.Skip("计划还没走完（当前 18 条）；M6 收尾时把本文件的 planComplete 改成 true，这条测试就会开始要求 50 条")
 	}
 	if len(expectedRoutes) != 50 {
 		t.Fatalf("§4 规定最终是 50 条路由，expectedRoutes 里现在有 %d 条", len(expectedRoutes))
@@ -103,7 +131,7 @@ func TestNoPanicOnSetup(t *testing.T) {
 			t.Fatalf("Setup 时 panic 了，极可能是 Gin 路由树冲突（同一层混用静态段和 :id 参数段）：%v", r)
 		}
 	}()
-	if _, err := Setup(testConfig(), nil); err != nil {
+	if _, err := Setup(testConfig(t), nil); err != nil {
 		t.Fatalf("Setup 返回了 error：%v", err)
 	}
 }
@@ -123,8 +151,8 @@ func TestSetupRejectsBadJWTConfig(t *testing.T) {
 	}{
 		{"密钥为空（零值 Config）", config.Config{JWTExpire: time.Hour}},
 		{"密钥太短", config.Config{JWTSecret: "abc123", JWTExpire: time.Hour}},
-		{"有效期为 0", config.Config{JWTSecret: testConfig().JWTSecret}},
-		{"有效期为负", config.Config{JWTSecret: testConfig().JWTSecret, JWTExpire: -time.Hour}},
+		{"有效期为 0", config.Config{JWTSecret: testConfig(t).JWTSecret}},
+		{"有效期为负", config.Config{JWTSecret: testConfig(t).JWTSecret, JWTExpire: -time.Hour}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

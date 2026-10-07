@@ -46,8 +46,10 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	//   AccessLog 必须在 Recovery 外面 —— Recovery 在内层把 panic 转成 500 之后正常返回，
 	//     AccessLog 才能记到真实的 500；反过来放的话 panic 会穿过 AccessLog，
 	//     它的 defer 在栈展开时执行，那时 c.Writer.Status() 还是默认的 200，日志会撒谎
-	//   Recovery 必须在最内层 —— 它要兜住 handler 里的 panic
-	e.Use(middleware.RequestID(), middleware.AccessLog(), middleware.Recovery())
+	//   Recovery 必须包住所有 handler —— 它要兜住 handler 里的 panic
+	//   MaxBodySize 只给 body 套一层限流读取器，和上面三条的顺序约束无关，
+	//     放最后是为了不打断那三条
+	e.Use(middleware.RequestID(), middleware.AccessLog(), middleware.Recovery(), middleware.MaxBodySize())
 
 	e.NoRoute(apperr.NoRoute)
 	e.NoMethod(apperr.NoMethod)
@@ -89,6 +91,61 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	me.POST("/change-password", authH.ChangePassword)
 
 	// ---- M2：字典·物品·上传（#6–#8、#13–#19、#40、#42）----
+
+	// NewUpload 会 MkdirAll，返回 error 是因为磁盘不可写时必须在启动阶段就炸 ——
+	// 拖到第一个用户点「发布拾物」再失败，他只会看到一个 INTERNAL。
+	uploads, err := service.NewUpload(cfg.UploadDir, cfg.UploadBaseURL, slog.Default())
+	if err != nil {
+		return nil, fmt.Errorf("router.Setup: %w", err)
+	}
+
+	dictRepo := repo.NewDict(pool)
+	itemRepo := repo.NewItem(pool)
+
+	dictSvc := service.NewDict(dictRepo)
+	itemSvc := service.NewItem(itemRepo, dictRepo, uploads, slog.Default())
+
+	dictH := handler.Dict{Svc: dictSvc}
+	itemH := handler.Item{Svc: itemSvc}
+	uploadH := handler.Upload{Svc: uploads}
+
+	// #40 静态文件。挂在 engine 上而不是 api 组里：计划里的路径就是
+	// /uploads/*filepath，不带 /api 前缀，而且它**不走 JSON 信封**（直接回图片二进制）。
+	e.Static(cfg.UploadBaseURL, uploads.Dir())
+
+	// #6 要登录：匿名上传等于给全网开一个免费图床，磁盘会被填满。
+	api.POST("/uploads", jwt, uploadH.Create)
+
+	// #7 #8 公开：未登录也要能逛广场并按分类/地点筛选，
+	// 拿不到字典树，前端那两个三级下拉框根本渲染不出来。
+	api.GET("/categories", dictH.Categories)
+	api.GET("/locations", dictH.Locations)
+
+	// #13 #14 #15 #16 #17 #18。
+	//
+	// 全部写在 api 上而不是开一个 /items 子组：这几条的鉴权**不一样**
+	// （列表公开、详情公开但要认人、其余要登录），套进一个组里就得给组挑一个
+	// 最宽松的中间件再在 handler 里补判断，那正是「漏掉鉴权」这类 bug 的温床。
+	// 逐条写出来，每条路由需要什么鉴权是一个看得见的结构事实。
+	api.GET("/items", itemH.List)
+	api.POST("/items", jwt, itemH.Create)
+
+	// #15 公开但挂 OptionalJWT：contact 的可见性规则里有「发帖人本人」和
+	// 「已解锁过」两个分支，所以它必须知道当前是谁在看 —— 但没登录也绝不能 401，
+	// 因为帖子内容本身对所有人开放，只有联系方式是锁着的。
+	api.GET("/items/:id", middleware.OptionalJWT(signer, users), itemH.Detail)
+
+	api.PUT("/items/:id", jwt, itemH.Update)
+	api.DELETE("/items/:id", jwt, itemH.Delete)
+	api.PATCH("/items/:id/status", jwt, itemH.ChangeStatus)
+
+	// #19「我的发布」。走 /api/my/... 而不是 /api/items/mine，
+	// 理由见本文件开头那条 Gin 路由树注释。
+	api.GET("/my/items", jwt, itemH.ListMine)
+
+	// #42 帖主自删单张图片。路径里没有 item id —— 图片自己的 id 已经够定位了。
+	api.DELETE("/item-images/:id", jwt, itemH.DeleteImage)
+
 	// ---- M3：匹配（#20）----
 	// ---- M4：解锁·通知·举报（#21、#22、#30–#32、#41）----
 	// ---- M5：归还确认·积分（#23–#29、#33）----
