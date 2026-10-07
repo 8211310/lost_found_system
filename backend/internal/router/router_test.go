@@ -43,6 +43,15 @@ var expectedRoutes = []string{
 	"GET /api/my/notifications/unread-count", // #31
 	"PUT /api/my/notifications/read",         // #32
 	"POST /api/items/:id/report",             // #41
+	// ---- M5 ----
+	"POST /api/items/:id/returns",   // #23
+	"GET /api/returns/:id",          // #24
+	"POST /api/returns/:id/confirm", // #25
+	"POST /api/returns/:id/reject",  // #26
+	"POST /api/returns/:id/cancel",  // #27
+	"GET /api/my/returns/submitted", // #28
+	"GET /api/my/returns/received",  // #29
+	"GET /api/my/credit-logs",       // #33
 }
 
 // testConfig 给 Setup 一份**能通过校验**的最小配置。

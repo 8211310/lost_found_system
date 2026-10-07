@@ -159,6 +159,49 @@ type LedgerRow struct {
 	NotifyBody  string
 }
 
+// LedgerLostAuthors 取出「台账里和这条 found 帖配过对的那些 lost 帖，它们的作者分别是谁」。
+//
+// 这是 M5 的 confirm 需要的唯一一次台账反查：东西确认还回去了，
+// 当初被 new_match 叫醒的那些人应该收到一个结束（item_returned_hint）。
+// 读放在 Match 而不是 ItemReturn，是因为 **match_pairs 这张表只有这一个主人** ——
+// 谁都能写它的读路径，「台账和通知是不是原子」那套推理就会开始模糊。
+//
+// SELECT DISTINCT 的是**作者**而不是配对行：一条 found 帖可能和同一个人的两条失物帖
+// 都配过对（他丢了两个相似的东西），那是同一个人在等同一件事，
+// 而且这条通知的 item_id 指向的就是这条 found 帖 —— 发两条，点进去是同一个页面。
+//
+// ⚠ 不按失物帖的状态筛（closed / deleted 的作者照样在名单里）。
+// 要筛就得先定义「什么状态的失主不配知道东西已经还回去了」，
+// 而那是裁决而不是记录（定位原则 1）。他被 new_match 叫醒过，就该收到收尾。
+//
+// 提交人自己如果也是 lost 作者，会同时拿到 return_confirmed 和 item_returned_hint 两条 ——
+// 这是计划 §13 第 4 步明确写的形状，不是重复发送的 bug。
+func (r *Match) LedgerLostAuthors(ctx context.Context, foundItemID int64) ([]int64, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT i.user_id
+		  FROM match_pairs mp
+		  JOIN items i ON i.id = mp.lost_item_id
+		 WHERE mp.found_item_id = $1
+		 ORDER BY 1`, foundItemID)
+	if err != nil {
+		return nil, fmt.Errorf("repo.Match.LedgerLostAuthors (found=%d): %w", foundItemID, err)
+	}
+	defer rows.Close()
+
+	out := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("repo.Match.LedgerLostAuthors 扫描一行: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("repo.Match.LedgerLostAuthors 迭代: %w", err)
+	}
+	return out, nil
+}
+
 // RecordMatches 在一个事务里写台账 + 发通知，返回**真正新发出去**的通知条数。
 //
 // 返回值不等于 len(rows)，这是这个函数存在的全部意义：

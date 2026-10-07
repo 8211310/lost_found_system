@@ -105,6 +105,8 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	contactRepo := repo.NewContact(pool)
 	notifRepo := repo.NewNotification(pool)
 	reportRepo := repo.NewReport(pool)
+	returnRepo := repo.NewItemReturn(pool)
+	creditRepo := repo.NewCredit(pool)
 
 	dictSvc := service.NewDict(dictRepo)
 
@@ -127,12 +129,26 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 
 	itemSvc := service.NewItem(itemRepo, dictRepo, uploads, matchSvc, contactRepo, slog.Default())
 
+	// M5 的两条链。returnSvc 依赖四个只读接缝和 returnRepo 这一个写入口：
+	//   - itemRepo 只被当 ItemLookup（只有 GetByID）用，所以归还服务改不了任何帖子；
+	//     confirm 那次关帖住在 repo.ItemReturn.Confirm 的事务里，不在这儿。
+	//   - matchRepo 只被当 LedgerLookup 用（只读台账），归还服务不能往 match_pairs 写。
+	//   - users 只被当 UserLookup 用（只读一行 users）—— 加那 10 分和 2 分的
+	//     唯一路径是 repo.Confirm 内部的 applyCredit，所以这条装配图上
+	//     根本不存在「service 直接改分」这条路。
+	// 三个窄接口在编译期就把「谁能写什么」钉死了，这是 §10 第①层能数调用次数
+	// 做断言的前提：fake 只需要实现这几个方法就能顶住整个服务。
+	returnSvc := service.NewItemReturn(returnRepo, itemRepo, matchRepo, users, uploads, slog.Default())
+	creditSvc := service.NewCredit(creditRepo, slog.Default())
+
 	dictH := handler.Dict{Svc: dictSvc}
 	itemH := handler.Item{Svc: itemSvc}
 	matchH := handler.Match{Svc: matchSvc}
 	contactH := handler.Contact{Svc: contactSvc}
 	notifH := handler.Notification{Svc: notifSvc}
 	reportH := handler.Report{Svc: reportSvc}
+	returnH := handler.ItemReturn{Svc: returnSvc}
+	creditH := handler.Credit{Svc: creditSvc}
 	uploadH := handler.Upload{Svc: uploads}
 
 	// #40 静态文件。挂在 engine 上而不是 api 组里：计划里的路径就是
@@ -205,6 +221,38 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	api.POST("/items/:id/report", jwt, reportH.Create)
 
 	// ---- M5：归还确认·积分（#23–#29、#33）----
+
+	// #23 提交归还确认。路径以**帖子**为锚（/api/items/:id/returns）：
+	// 提交那一刻那条确认还不存在，没有 id 可用。下面六条全部以确认为锚。
+	//
+	// 挂普通 jwt，不设任何前置门槛（不要求先解锁联系方式、不要求匹配过）——
+	// §16 把 RETURN_NOT_UNLOCKED 整个删掉了。防乱提交靠的是凭证图必填、
+	// 部分唯一索引（一条帖子同时只能有一条 pending）和发帖人的判断，不是靠流程门槛。
+	api.POST("/items/:id/returns", jwt, returnH.Submit)
+
+	// #24 归还确认详情：提交人 / 发帖人 / Admin 三方可见，判断在 service 里。
+	// 走 jwt 而不是 OptionalJWT：三方里没有「匿名」这一方，401 才是正确答案。
+	api.GET("/returns/:id", jwt, returnH.Detail)
+
+	// #25 #26 发帖人的两个决定。这两条是**全系统唯一**「admin 也不行」的端点，
+	// 而那句话在这里是注释、在 service 里才是代码
+	// （authorizeReturnDecision 只看 id 相等，一次都没读 role）。
+	// 所以不要在这里加任何按 role 的分支来「方便管理员」—— 那等于让平台裁决归属。
+	api.POST("/returns/:id/confirm", jwt, returnH.Confirm)
+	api.POST("/returns/:id/reject", jwt, returnH.Reject)
+
+	// #27 提交人撤销自己那条 pending：零副作用、不发通知。
+	api.POST("/returns/:id/cancel", jwt, returnH.Cancel)
+
+	// #28 #29 两个列表都收在 /api/my/ 下：「谁的列表」永远来自 JWT。
+	// 两个端点的区别只有 JOIN 出来的那一列（submitter_id 还是 items.user_id），
+	// 所以它们共用一套分页和状态筛选 —— 用户在两个页面上看到的翻页行为必须一模一样。
+	api.GET("/my/returns/submitted", jwt, returnH.ListSubmitted)
+	api.GET("/my/returns/received", jwt, returnH.ListReceived)
+
+	// #33 积分流水。只读，且只能读自己的（表里的每一行都指向一次真实的归还）。
+	api.GET("/my/credit-logs", jwt, creditH.MyLogs)
+
 	// ---- M6：治理与管理后台（#9–#12、#34–#37、#39、#43–#50）----
 
 	return e, nil

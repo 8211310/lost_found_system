@@ -19,9 +19,14 @@ import (
 // 那个事务属于「匹配」这件事，不属于「通知」这件事，所以它留在 match.go。
 //
 // 如果这里再放一个 Push/Insert 方法，M5 就会有两个地方能写通知，
-// 而「台账和通知是不是原子」这件事就变回靠自觉了。真到 M5 需要发
-// 归还类通知时，应该往这个文件里加一个**带业务上下文的事务方法**，
-// 而不是一个通用的 INSERT。
+// 而「台账和通知是不是原子」这件事就变回靠自觉了。
+//
+// **M5 实际上把归还类通知写在了 repo/item_return.go**（Submit / Confirm / Reject 三个事务里），
+// 而不是回到本文件加一个通用 INSERT —— 通知是那次归还确认的后果，
+// 它必须和产生它的那件事同生同死，所以它住在那件事的文件里。
+// 到这里为止，全站能写 notifications 的位置恰好三个：
+// repo.Match.RecordMatches（new_match）、repo.ItemReturn 的三个动作、
+// 以及 M6 的治理动作。本文件一个都没有。
 type Notification struct {
 	pool *pgxpool.Pool
 }

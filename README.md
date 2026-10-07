@@ -26,7 +26,10 @@
 失物招领系统/
 ├── docs/                        # 杭电助手 SSO 调研文档（M8 的唯一权威依据，不要覆盖）
 ├── docker-compose.yml           # postgres + adminer，只跑这两个
-├── scripts/smoke.sh             # Git Bash + curl 手工冒烟脚本
+├── scripts/
+│   ├── setup-postgres.sh        # 原生 Windows PostgreSQL 的初始化脚本
+│   ├── smoke.sh                 # 冒烟脚本的运行器：选节、补依赖、跑前置检查
+│   └── smoke/                   # 判据本体，一个里程碑一个文件 + lib.sh
 └── backend/
     ├── cmd/server/main.go       # 唯一入口，可通读
     ├── migrations/              # golang-migrate 迁移文件，程序启动时自动应用
@@ -176,8 +179,30 @@ REQUIRE_INTEGRATION=1 go test ./...
 后端跑着的时候，另开一个终端：
 
 ```bash
-bash scripts/smoke.sh
+bash scripts/smoke.sh            # 全部里程碑的判据都跑一遍
+bash scripts/smoke.sh m5         # 只跑 M5（归还确认 · 积分）
+bash scripts/smoke.sh m3         # 跑 M3，运行器自动补上它依赖的 m1 m2
+bash scripts/smoke.sh --list     # 看有哪些节、谁依赖谁
 ```
+
+判据本体在 `scripts/smoke/` 下，一个里程碑一个文件（`lib.sh` 是公共工具，不含任何判据）：
+
+| 文件 | 覆盖的端点 | 依赖 |
+|---|---|---|
+| `smoke/m0-baseline.sh` | #38 健康检查、信封契约、RequestID 防线 | 无 |
+| `smoke/m1-auth.sh` | #1–#5 + 封禁 | 无 |
+| `smoke/m2-items.sh` | #6–#8、#13–#19、#40、#42 | m1 |
+| `smoke/m3-match.sh` | #20 | m1 m2 |
+| `smoke/m4-notify.sh` | #21、#22、#30–#32、#41 | m1 m2 m3 |
+| `smoke/m5-return.sh` | #23–#29、#33 | 无（自包含） |
+
+⚠ **为什么大部分节不能单独跑**：它们要借用前面节建出来的用户和帖子
+（`$TOKEN`、`$MY_ID`、`$LOC_ID` 这些全局变量），所以必须跟着前面的节一起跑。
+这种借依赖写在每个文件开头的 `# deps:` 一行里，运行器照它自动补齐 ——
+宁可多跑几节，也不要因为 `$TOKEN` 是空的而报一堆假的 401。
+只有 `m5` 是自己注册五个用户、自己发帖、自己传图的，所以只有它真的能单跑。
+**这条自包含不是为了方便，是为了断言的诚实**：上一版 M5 借的是 M3/M4 留下的数据，
+于是「拾主手上有几条通知」实际测的是「上一节跑出了什么」，改 M4 会让 M5 假红。
 
 它用 curl 打一遍全链路，只断言 `code` 字段，**从不断言 message 文本**
 （message 是给人看的中文，随时可改；code 是稳定的机器码，永不改语义）。
@@ -410,7 +435,55 @@ bash scripts/smoke.sh
     请求实际是**匿名**发出去的（401），于是「没越权读到别人的东西」那条断言
     因为什么都没匹配到而**假绿**。M2 那节的 `?user_id=` 检查就是这样坏了一路的；
     现在两处都先断言「这个请求真的带着 token 拿到了 200」再谈有没有泄漏。
-- **未开工**：M5 归还确认·积分 ·
+- **M5 归还确认 · 积分 —— 已完成并验收（2026-10-07）**
+  §4 的 #23–#29、#33 共 8 条新路由（累计 33 条 / 最终 50 条）：
+  对一条 found 帖提交归还（可带凭证图）、发帖人查详情、确认、拒绝、提交人撤销、
+  「我提交的」/「我收到的」两个列表、积分流水。
+  验收实测：纯单测（不连库）auth 59 + middleware 15 + router 7 + service **496** +
+  repo 42 + model 5 + matcher 53 = **677 项全绿**（`TestFinalRouteCount` 仍按设计 SKIP，
+  它报的「当前 33 条」是从 `expectedRoutes` 那张表数出来的，不是写死的字面量）；
+  集成测试 `smoketest` **554 项全绿**（180 个顶层测试函数）；
+  `scripts/smoke.sh` **447 项全绿、0 跳过**。
+  §12 那条全链走通了一遍，几条只有测了才成立的性质：
+  - **归属只能由发帖人产生**（定位原则 5「admin 能销毁内容和账号，但不能制造归属」）：
+    #25/#26 对 admin 一律 `FORBIDDEN`，哪怕把他的 `role` 临时提成 admin ——
+    替拾主点「确认收到」就是替他做归属判断。admin 改归属是 #46（M6），
+    `ReviewKindAdminDataFix` 这个常量在 M5 **只声明、没有任何写路径**。
+  - 撤销和「被审」是两件事：`cancelled` 那行的 `reviewer_id`、`review_kind` 都是 NULL，
+    但 `reviewed_at` **会填** —— 它的实际含义是「这条记录退出 pending 的时刻」。
+    这一条第③层一开始写反了（要求三个全 NULL），红了之后读 `repo/item_return.go` 的
+    `Cancel` 才发现是**断言错、代码对**。
+  - 被拒之后重新提交是**一条新记录**，不是把 rejected 那行改回 pending ——
+    那个唯一索引只挡 pending（`item_id, submitter_id WHERE status='pending'`），
+    所以同一个人对同一条帖可以有一条 rejected 和一条 pending 并存。
+  - 通知是不对称的，而且撤销这一支**一条都不发**：确认 → 提交人 `return_confirmed`
+    + 配对 lost 帖的作者各一条 `item_returned_hint`；拒绝 → 只通知提交人；
+    撤销 → 谁都不通知。`item_returned_hint` 按**作者**去重：失主 A 有两条帖命中这条
+    found 帖，他只收到 **1** 条 —— 少了这条断言，「同一人两帖发两条骚扰通知」的实现
+    能一路绿到底。
+  - 加分只发生在 confirm 那一支：发帖人 +10、提交人 +2，两条 `credit_logs` 都挂着
+    这条归还确认（`ref_type='item_return'` + `ref_id`）；拒绝则**一行流水都不写**，
+    两个人的分数还是 100。#33 存在的唯一理由是让 110 可解释，所以判据是
+    **Σ流水 + 100 == credit_score**，而且是从**响应**里算出来的，不是从库里。
+  - 提交归还**不需要**先解锁联系方式（§16 删掉了那道前置校验）—— 这一条专门测了：
+    小刘一行 `contact_views` 都没写，仍然拿到了 200。
+  - §13 第 10 步的审计不变式是全表级的：不能有「已终态却没有 `review_kind`」的行，
+    也不能有「还 pending 却已经有 `review_kind`」的行。
+  - ⚠ 第③层这次有**三条红是测试自己的错**，产品一行都没改，形状各不相同：
+    ① 数**绝对值**而不是增量 —— 「拾主那边还是 1 条 `return_submitted`」借的是上一节
+    留下的数据，而本节小刘提交了三次，每次都给拾主发一条，于是永远红；
+    ② 上面那条 `reviewed_at`，代码对断言错；
+    ③ 在整个响应体里搜 `"message"` 判「列表里不该有 message」—— 信封**自己**就有
+    顶层的 `"message":"ok"`，这条判据会永远红。改成数 `"message":` 出现的次数
+    （信封恒 1 次）。顺带记一个 bash 坑：`${BODY#*'"data":}` 这种在 `${}` 里放单引号的
+    写法会让整份文件从那一行起解析错位，报出来的是「某变量: unbound variable」，
+    和真实原因毫无关系 —— 剥信封这件事现在不做，改成计数。
+- **冒烟脚本按里程碑拆开了**（M5 验收过程中做的，不是重构癖）：原来那份 1646 行、
+  后来 2016 行的单文件没法只跑一节，而上面①②两条假红的根源恰恰是「跨节借数据」。
+  现在是 `scripts/smoke.sh`（运行器：选节、按 `# deps:` 补依赖、跑前置检查）
+  + `scripts/smoke/{lib.sh, m0…m5-*.sh}`。选节跑：`bash scripts/smoke.sh m5`；
+  看依赖表：`--list`。
+- **未开工**：
   M6 治理与管理后台 · M7 前端 · M8 杭电助手 SSO（外部阻塞中）
 
 路由清单见 `internal/router/router.go` —— 那是 §4 全部 50 条路由的唯一注册点，
@@ -461,7 +534,7 @@ argv 要按当前代码页转换一次，本机是 `cp1252`，汉字不在里面
 printf '%s' '{"nickname":"冒烟"}' | curl -X POST .../api/auth/register --data-binary @-
 ```
 
-`scripts/smoke.sh` 里的 `req()` 函数统一走 stdin，就是这个原因。
+`scripts/smoke/lib.sh` 里的 `req()` 函数统一走 stdin，就是这个原因。
 以后手写 curl 命令测中文时记得这一点，否则会误判成「后端不支持 UTF-8」。
 顺带一个判据：**响应里的**中文一直是好的（stdout 不做这次转换），
 所以「发出去变问号、收回来正常」这个组合就是 argv 的锅，不是数据库编码的锅。
