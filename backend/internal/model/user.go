@@ -116,6 +116,49 @@ func (u *User) View() UserView {
 	}
 }
 
+// AdminUserView 是 #34 GET /api/admin/users 的 list 元素。
+//
+// 它和 UserView **不是同一个形状**，而且是刻意的两套：
+//   - **多了 status**：管理员找人的一个主要目的就是核对「这个人被封了没有」，
+//     而 #3 GET /api/auth/me 永远只需要自己的那一个值
+//   - **少了 phone / email / avatar_url**：管理员页是一个会一次列出几十个人的列表页，
+//     而这三列是全站最直接的骚扰工具（§3.4 讨论过的「联系方式只能靠 #21 解锁得到」）。
+//     一个治理列表页需要回答的是「这是谁、什么身份、什么状态、几分」，
+//     把手机号铺在一页 20 行的表格里，等于把 §3.4 那套解锁纪律从后台绕过去了
+//
+// 所以这不是「同一份数据少返回几列」，是**两个不同的问题**：#3 问「我是谁」，
+// #34 问「这些人是谁」。合并成一个结构体迟早会有一边被另一边的需求带偏。
+type AdminUserView struct {
+	ID          int64  `json:"id"`
+	Username    string `json:"username"`
+	Nickname    string `json:"nickname"`
+	RealName    string `json:"real_name"`
+	AuthSource  string `json:"auth_source"`
+	Role        string `json:"role"`
+	Status      string `json:"status"`
+	CreditScore int    `json:"credit_score"`
+	CreatedAt   string `json:"created_at"`
+}
+
+// AdminView 把一行 users 转成 #34 的形状。
+//
+// 它读的是**内存里已经有的那一行**，不额外查库 —— 所以「哪些列被扫进来了」
+// 就是「哪些列可能被返回」的上界。repo.User.ListByFilter 那条 SQL 刻意没 SELECT
+// password_hash / phone / email，这里就算想给也给不出来。
+func (u *User) AdminView() AdminUserView {
+	return AdminUserView{
+		ID:          u.ID,
+		Username:    deref(u.Username),
+		Nickname:    u.Nickname,
+		RealName:    deref(u.RealName),
+		AuthSource:  u.AuthSource,
+		Role:        u.Role,
+		Status:      u.Status,
+		CreditScore: u.CreditScore,
+		CreatedAt:   u.CreatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
 // deref 把 *string 的 NULL 折成空串。
 func deref(s *string) string {
 	if s == nil {

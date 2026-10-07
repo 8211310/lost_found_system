@@ -17,6 +17,7 @@
 #   smoke/m3-match.sh     #20 匹配
 #   smoke/m4-notify.sh    #21、#22、#30–#32、#41 解锁、收件箱、举报
 #   smoke/m5-return.sh    #23–#29、#33 归还确认与积分
+#   smoke/m6-governance.sh #34–#37、#39、#43–#50 治理动作、留痕、举报处置
 #
 # 用法（Git Bash）：
 #   docker compose up -d                          # Docker 路径
@@ -25,6 +26,7 @@
 #   bash scripts/smoke.sh                         # 全部跑（默认）
 #   bash scripts/smoke.sh m3                      # 跑 m3，并自动补上它依赖的 m1 m2
 #   bash scripts/smoke.sh m5                      # m5 自包含，真的只跑 m5
+#   bash scripts/smoke.sh m6                      # m6 也自包含（还要本机有 psql，见那一节开头）
 #   bash scripts/smoke.sh --list                  # 看有哪些节、谁依赖谁
 #
 # 换端口：BASE=http://localhost:9090 bash scripts/smoke.sh
@@ -33,7 +35,9 @@
 #   （$TOKEN、$MY_ID、$LOC_ID 这些全局变量），所以它必须跟着前面的节一起跑。
 #   这种借依赖写在每个文件开头的 `# deps:` 一行里，运行器照它自动补齐 ——
 #   宁可多跑几节，也不要因为 $TOKEN 是空的而报一堆假的 401。
-#   目前只有 m5 做到了自包含（自己注册用户、自己发帖、自己传图），所以只有它能真的单跑。
+#   目前只有 m5 和 m6 做到了自包含（各自注册用户、m5 还自己发帖传图），所以只有它们能真的单跑。
+#   m6 多一个前提：它得用 psql 把治理身份造出来（没有种子 admin，而提角色本身要 admin），
+#   所以本机没装 psql 时那一节整节 SKIP —— 那是「环境缺东西」，不是「治理接口坏了」。
 
 set -uo pipefail
 
@@ -43,7 +47,7 @@ BASE="${BASE:-http://localhost:8080}"
 
 # 唯一的顺序来源：既是可用的里程碑列表，也是执行顺序。
 # 新加一节就在这里加一行，同时建一个 <这一行>-<名字>.sh。
-ORDER=(m0 m1 m2 m3 m4 m5)
+ORDER=(m0 m1 m2 m3 m4 m5 m6)
 
 # ---------------------------------------------------------------- 参数
 usage() {

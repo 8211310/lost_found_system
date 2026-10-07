@@ -475,6 +475,237 @@ func (r *Item) DeleteImage(ctx context.Context, imageID int64) (string, error) {
 	return path, nil
 }
 
+// UpdateTx 覆写帖子的可编辑字段，**在调用方的事务里**，并带出作者 id。
+//
+// 存在的唯一理由就是 #16 的 admin 分支：管理员改别人的帖子必须留痕（§4 表头那条
+// 「admin 调用时 admin_reason 必填且写 admin_actions」），而留痕和这次改动必须同事务。
+// 上面那个 Update 自己 Begin/Commit，套不进去。
+//
+// 中间那步「取作者 id」单独发一条 SQL，而不是像 ImageWithOwner 那样 JOIN：
+// UPDATE ... RETURNING user_id 看着更省，但改帖的 WHERE 只有 id，
+// 一条**没改动任何列**的更新（管理员提交了和原来一模一样的标题）在 PG 里
+// 照样会返回一行，所以这条 SQL 省不掉，加了 JOIN 反而把 UPDATE 变复杂。
+// 真正的省法是让它和 UPDATE 在同一个事务里 —— 现在就是了。
+func (r *Item) UpdateTx(ctx context.Context, tx pgx.Tx, id int64, p UpdateItemRow) (int64, error) {
+	var ownerID int64
+	err := tx.QueryRow(ctx, `
+		UPDATE items
+		   SET title = $2, description = $3, category_id = $4, location_id = $5,
+		       location_detail = $6, last_seen_at = $7, lost_at = $8, found_at = $9,
+		       contact = $10, updated_at = now()
+		 WHERE id = $1
+		RETURNING user_id`,
+		id, p.Title, p.Description, p.CategoryID, p.LocationID, p.LocationDetail,
+		p.LastSeenAt, p.LostAt, p.FoundAt, p.Contact).Scan(&ownerID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, apperr.WrapMsg(err, apperr.CodeNotFound, "帖子不存在")
+		}
+		if ae := TranslateConstraint(err); ae != nil {
+			return 0, ae
+		}
+		return 0, fmt.Errorf("repo.Item.UpdateTx(%d): %w", id, err)
+	}
+	return ownerID, nil
+}
+
+// ReplaceImagesTx 重建一条帖子的图片列表，**在调用方的事务里**。
+//
+// 它是上面那个 Update 里那两步（DELETE 旧行 + 多值 INSERT）的独立版本，存在的理由
+// 只有一个：#16 的 admin 分支要在**一个事务里**做完「改字段 + 改图片 + 写留痕」，
+// 而 Update 自己 Begin/Commit，套不进去。图片不放进这个事务会留下一种很难解释的状态 ——
+// 文字改了、留痕写了、图还是旧的，而留痕里那句「管理员改过这条帖子」指的其实是全部字段。
+//
+// ⚠ 和 `UpdateItemRow.ImagePaths == nil` 那条规矩一样，本函数**不接受 nil**：
+// 调用方只在「请求体里确实带了 images」时才该调它。这里收的是 []string 而不是 *[]string，
+// 因为「传一个空切片」在这里有明确含义（把图全删掉），而 nil 会被 insertImages
+// 当成「什么都不做」，于是一次「清空图片」的改帖会变成「图片一张没删、留痕却说改了」。
+// 两者混淆的代价是数据，不是报错，所以在这一层就把形状钉死。
+func (r *Item) ReplaceImagesTx(ctx context.Context, tx pgx.Tx, itemID int64, paths []string) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM item_images WHERE item_id = $1`, itemID); err != nil {
+		if ae := TranslateConstraint(err); ae != nil {
+			return ae
+		}
+		return fmt.Errorf("repo.Item.ReplaceImagesTx(%d) 清空旧图片: %w", itemID, err)
+	}
+	return insertImages(ctx, tx, itemID, paths)
+}
+
+// TakenRow 是批量下架里**真的被动过一行**的那个帖子。
+type TakenRow struct {
+	ItemID int64
+	UserID int64
+}
+
+// TakedownTx 批量下架（#43）：把这批帖子的 status 改成 deleted，返回**实际被改掉**的那些行。
+//
+// 两条 SQL，顺序不能反：
+//
+//	① 预检存在性 —— 有一个 id 压根不存在就整批失败，返回 NOT_FOUND，一条都不改。
+//	② UPDATE ... WHERE status <> 'deleted' —— 已经是 deleted 的跳过。
+//
+// 为什么要有 ① ：没有它，「50 个 id 里有一个是打错的」会表现为「下架了 49 条」，
+// 而管理员以为处理干净了。宁可整批失败让人把 id 改对。
+// 为什么要有 ② 那个 `status <> 'deleted'`：作者自己早就删过的帖子不该再算进
+// taken_down，更不该因为它给作者再发一条「你的帖子被下架了」的通知 ——
+// 那条通知是假的，他根本没被处置。
+//
+// 为什么两条不合成一条：PG 里 `UPDATE ... WHERE id = ANY(...)` 影响不到不存在的主键，
+// 而「少了几个」既可能是「不存在」也可能是「已经是 deleted」，一条 SQL 分不出这两种，
+// 分不出就给不出正确的错误码。
+//
+// ⚠ 调用方传的 ids 必须**已经去重**。① 是拿 `count(*)` 和 len(ids) 比大小的，
+// 数组里重复的 id 只会命中一行，比出来就是「有帖子不存在」—— 一个假错。
+// 去重放在 service：那是「一次请求的意图」层面的规范化，而且留痕里的 detail.ids
+// 也要的是去重之后的那份（§12 M6 判据 ③：detail.ids 长度 50）。
+func (r *Item) TakedownTx(ctx context.Context, tx pgx.Tx, ids []int64) ([]TakenRow, error) {
+	var exist int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM items WHERE id = ANY($1::bigint[])`, ids).Scan(&exist); err != nil {
+		return nil, fmt.Errorf("repo.Item.TakedownTx 预检存在性 (%d 个 id): %w", len(ids), err)
+	}
+	if exist != len(ids) {
+		return nil, apperr.WrapMsg(pgx.ErrNoRows, apperr.CodeNotFound,
+			fmt.Sprintf("这批 id 里有 %d 条帖子不存在", len(ids)-exist))
+	}
+
+	rows, err := tx.Query(ctx, `
+		UPDATE items SET status = 'deleted', updated_at = now()
+		 WHERE id = ANY($1::bigint[]) AND status <> 'deleted'
+		RETURNING id, user_id`, ids)
+	if err != nil {
+		if ae := TranslateConstraint(err); ae != nil {
+			return nil, ae
+		}
+		return nil, fmt.Errorf("repo.Item.TakedownTx (%d 个 id): %w", len(ids), err)
+	}
+	defer rows.Close()
+
+	out := []TakenRow{}
+	for rows.Next() {
+		var t TakenRow
+		if err := rows.Scan(&t.ItemID, &t.UserID); err != nil {
+			return nil, fmt.Errorf("repo.Item.TakedownTx 扫描一行: %w", err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("repo.Item.TakedownTx 迭代: %w", err)
+	}
+	return out, nil
+}
+
+// RestoreTx 恢复一条被下架的帖子（#44）：status 从 deleted 回到 open，返回作者 id。
+//
+// 影响 0 行时**必须再查一次**才知道该报哪个错，而这两种情况的文案完全不同：
+//   - id 压根不存在 → NOT_FOUND
+//   - 存在但当前不是 deleted → VALIDATION（「这条帖子现在不是被下架的状态」）
+//
+// 都报 NOT_FOUND 的话，管理员对着一条 open 的帖子点恢复，看到的是「帖子不存在」——
+// 他会以为数据丢了，然后去翻数据库。这就是为什么这里多发一条 SELECT：
+// 错误信息得说对。这条 SELECT 也在同一个事务里，读到的就是刚才那一次判断的依据。
+//
+// ⚠ 恢复的目标状态写死 'open'，不是「恢复成下架之前那个状态」。理由是这个库没有存
+// 下架之前的状态（items 只有一列 status），而 #43 的留痕里存的是 id 列表不是状态快照。
+// 真要精确恢复就得给 items 加一列 `pre_takedown_status`，为一年发生不了几次的
+// 「下架了一条已归还的帖」加一列不值当。代价写在注释里：
+// 一条本来 closed（已确认归还）的帖子被下架又被恢复之后，它会变回 open。
+func (r *Item) RestoreTx(ctx context.Context, tx pgx.Tx, id int64) (int64, error) {
+	var ownerID int64
+	err := tx.QueryRow(ctx, `
+		UPDATE items SET status = 'open', updated_at = now()
+		 WHERE id = $1 AND status = 'deleted'
+		RETURNING user_id`, id).Scan(&ownerID)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		if err != nil {
+			if ae := TranslateConstraint(err); ae != nil {
+				return 0, ae
+			}
+			return 0, fmt.Errorf("repo.Item.RestoreTx(%d): %w", id, err)
+		}
+		return ownerID, nil
+	}
+
+	var current string
+	switch err := tx.QueryRow(ctx, `SELECT status FROM items WHERE id = $1`, id).Scan(&current); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, apperr.WrapMsg(err, apperr.CodeNotFound, "帖子不存在")
+	case err != nil:
+		return 0, fmt.Errorf("repo.Item.RestoreTx(%d) 复核当前状态: %w", id, err)
+	}
+	return 0, apperr.Validation(fmt.Sprintf("这条帖子现在是 %s，不是被下架的帖子，没什么可恢复的", current),
+		apperr.FieldError{Field: "id", Msg: "只有 status='deleted' 的帖子能被恢复"})
+}
+
+// DeletedImage 是 #45 删掉一张图片时**从被删的那一行里**带出来的事实。
+//
+// 为什么图片自己的 id 和它所属帖子的 id 都要带出来（看起来只要一个就能定位）：
+//   - image_id → 留痕的 target_id。管理员处置的对象是这张图，留痕就该指向它；
+//     指到帖子那儿，事后翻 admin_actions 就看不出到底是帖子被改了还是图被删了
+//   - item_id → 通知要带跳转目标（§4 的 notifications.item_id），作者点进去
+//     得落到那张图所在的帖子
+//   - path → 磁盘上那个文件。行删掉之后这个路径**再也查不出来**，
+//     不在 RETURNING 里带出来就只能留一个没人认领的文件，而里面可能是别人的照片
+//   - user_id → 帖子作者，通知发给谁
+type DeletedImage struct {
+	ImageID int64
+	ItemID  int64
+	UserID  int64
+	Path    string
+}
+
+// DeleteImageTx 删一行图片，**在调用方的事务里**，返回磁盘路径和这条帖子作者的 id。
+//
+// 和上面那个 DeleteImage（#42，帖主自删）的区别只有一个：这一条要 JOIN 出作者。
+// 因为 #45 是管理员删**别人**的图，删完必须给他发一条「你帖子的一张图被删了」的通知，
+// 而 item_images 表里只有 item_id —— 没有作者这一列可给。
+//
+// DELETE ... USING ... RETURNING 一条搞定，而不是「先 SELECT 拿 path 和作者，再 DELETE」：
+// 两条之间那一瞬间，帖子可能已经被删了（items 被删会级联删掉图片行），
+// 那条 DELETE 就会静默影响 0 行，而调用方以为自己删掉了、还顺手给一个已经不存在的
+// 作者发了一条通知。RETURNING 没有这个缝。
+func (r *Item) DeleteImageTx(ctx context.Context, tx pgx.Tx, imageID int64) (*DeletedImage, error) {
+	var d DeletedImage
+	err := tx.QueryRow(ctx, `
+		DELETE FROM item_images im
+		     USING items i
+		 WHERE im.id = $1 AND i.id = im.item_id
+		RETURNING im.id, im.item_id, im.path, i.user_id`, imageID).
+		Scan(&d.ImageID, &d.ItemID, &d.Path, &d.UserID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apperr.WrapMsg(err, apperr.CodeNotFound, "图片不存在")
+		}
+		if ae := TranslateConstraint(err); ae != nil {
+			return nil, ae
+		}
+		return nil, fmt.Errorf("repo.Item.DeleteImageTx(%d): %w", imageID, err)
+	}
+	return &d, nil
+}
+
+// OwnerTx 在调用方的事务里取一条帖子的作者 id。
+//
+// 为什么单独有这一条这么短的 SQL：#49 的 `resolution=ban` 要封的是**被举报帖子的作者**，
+// 而 reports 表里没有那一列（只有 item_id），处置举报又必须在同一个事务里做完 ——
+// 用 pool 版本的 GetByID 去查就落在事务外面了，那中间帖子可能已经换了作者（不可能，
+// user_id 不可改）或整行被 admin 删了（可能）。更重要的是**分层**：
+// service 不该为了拿一列而自己写 SQL。
+//
+// 返回 NOT_FOUND 而不是 0：0 不是合法 id，让它一路走到 users 表的外键上，
+// 得到的是「用户不存在」这种指错对象的报错。
+func (r *Item) OwnerTx(ctx context.Context, tx pgx.Tx, itemID int64) (int64, error) {
+	var ownerID int64
+	err := tx.QueryRow(ctx, `SELECT user_id FROM items WHERE id = $1`, itemID).Scan(&ownerID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, apperr.WrapMsg(err, apperr.CodeNotFound, "帖子不存在")
+		}
+		return 0, fmt.Errorf("repo.Item.OwnerTx(%d): %w", itemID, err)
+	}
+	return ownerID, nil
+}
+
 // insertImages 批量插入图片行，sort_order 按传入顺序从 0 递增。
 //
 // 传入顺序 = 前端表单里的顺序 = 用户心里的「第一张图」，所以直接拿数组下标当

@@ -16,6 +16,7 @@ import (
 // 集合对不上时测试直接告诉你是哪条。加了路由却忘了更新这个列表也会红 —— 这正是我们想要的摩擦。
 //
 // 到 M6 收尾时这个列表必须恰好有 50 条（§4：49 个 JSON API + 1 个 /uploads 静态路由）。
+// 现在就是 50 条，而 TestFinalRouteCount 已经开始逐条比对。
 var expectedRoutes = []string{
 	"GET /api/health",                // #38
 	"POST /api/auth/register",        // #1
@@ -52,6 +53,29 @@ var expectedRoutes = []string{
 	"GET /api/my/returns/submitted", // #28
 	"GET /api/my/returns/received",  // #29
 	"GET /api/my/credit-logs",       // #33
+	// ---- M6 ----
+	//
+	// 这 17 条是「治理能力」的封闭集合，它有多重要看两条测试就够：
+	// TestNoAdminCommunityRoutesExist 断言这个集合里**没有** confirm / reject / 关帖 / 干预匹配，
+	// TestNonAdminBlockedFromAdminRoutes 断言集合外的普通用户一条都进不来。
+	// 所以将来谁想往后台加一个动作，改的应该是这两条测试的期望，而不是悄悄加一行路由。
+	"POST /api/admin/categories",          // #9
+	"DELETE /api/admin/categories/:id",    // #10
+	"POST /api/admin/locations",           // #11
+	"DELETE /api/admin/locations/:id",     // #12
+	"GET /api/admin/users",                // #34
+	"PUT /api/admin/users/:id/role",       // #35
+	"PUT /api/admin/users/:id/status",     // #36
+	"GET /api/admin/stats",                // #37
+	"GET /api/debug/config",               // #39（ENV=dev 才注册；testConfig 用的是 test，所以在这里）
+	"POST /api/admin/items/takedown",      // #43
+	"POST /api/admin/items/:id/restore",   // #44
+	"DELETE /api/admin/item-images/:id",   // #45
+	"DELETE /api/admin/returns/:id",       // #46
+	"POST /api/admin/users/:id/warn",      // #47
+	"GET /api/admin/reports",              // #48
+	"POST /api/admin/reports/:id/resolve", // #49
+	"GET /api/admin/actions",              // #50
 }
 
 // testConfig 给 Setup 一份**能通过校验**的最小配置。
@@ -77,9 +101,10 @@ func testConfig(t *testing.T) config.Config {
 
 // planComplete 在 M6 收尾时改成 true，TestFinalRouteCount 就开始要求 50 条。
 //
-// 现在用 skip 而不是删掉这条测试，是为了让「最终必须 50 条」这个要求一直看得见，
-// 而不是等到 M6 才想起来还要补一条测试。
-const planComplete = false
+// 之前用 skip 而不是删掉这条测试，是为了让「最终必须 50 条」这个要求一直看得见，
+// 而不是等到 M6 才想起来还要补一条测试。M6 走完了，所以现在它是真话：
+// §4 那 50 条全部注册完，列表里少一条、多一条都会红。
+const planComplete = true
 
 func TestSetupRegistersExactlyTheExpectedRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -153,6 +178,51 @@ func TestNoPanicOnSetup(t *testing.T) {
 	}()
 	if _, err := Setup(testConfig(t), nil); err != nil {
 		t.Fatalf("Setup 返回了 error：%v", err)
+	}
+}
+
+// TestDebugConfigRouteAbsentInProd 锁住「ENV=prod 时 /api/debug/config 压根不存在」。
+//
+// 这条测试测的是**注册**，不是 handler 里那一道 ENV 判断：
+// 生产环境里一个「返回 403 的调试端点」仍然在告诉探测者「这个路径是有的，只是你不该看」，
+// 而少注册一条路由的响应是 404，和任何别的不存在的路径没有区别。
+// 两道闸各管一种失误（路由表管「这行 if 被删了」，handler 管「路由被无条件注册了」），
+// 见 handler/debug.go 顶部那段。
+//
+// ⚠ gin.SetMode 改的是**全局**状态（本包每条测试第一行都设 TestMode，所以约定状态就是它），
+// 而 Setup 在 Env=prod 时会把它切成 ReleaseMode。这里 defer 还原，
+// 免得本测试跑完后同包的其他测试跑在另一个模式里。
+func TestDebugConfigRouteAbsentInProd(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer gin.SetMode(gin.TestMode)
+
+	prod := testConfig(t)
+	prod.Env = "prod"
+	e, err := Setup(prod, nil)
+	if err != nil {
+		t.Fatalf("Setup 返回了 error：%v", err)
+	}
+
+	for _, r := range e.Routes() {
+		if r.Method == http.MethodGet && r.Path == "/api/debug/config" {
+			t.Fatal("ENV=prod 时 /api/debug/config 不该被注册（它会把运行时配置吐到 HTTP 响应里）")
+		}
+	}
+
+	// 反向也要成立：dev/test 环境里它必须在，否则上面那个循环是在空转。
+	// 少这一句的话，将来有人把注册那行整个删掉，这条测试反而变绿。
+	dev, err := Setup(testConfig(t), nil)
+	if err != nil {
+		t.Fatalf("Setup(testConfig) 返回了 error：%v", err)
+	}
+	var found bool
+	for _, r := range dev.Routes() {
+		if r.Method == http.MethodGet && r.Path == "/api/debug/config" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("ENV=test 时 /api/debug/config 应该注册，否则本测试测的是空气")
 	}
 }
 

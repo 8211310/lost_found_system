@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/jackc/pgx/v5"
+
 	"lostfound/internal/apperr"
 	"lostfound/internal/model"
 	"lostfound/internal/repo"
@@ -24,6 +26,38 @@ type ItemStore interface {
 	ListImages(ctx context.Context, itemID int64) ([]model.ItemImage, error)
 	ImageWithOwner(ctx context.Context, imageID int64) (model.ItemImage, int64, error)
 	DeleteImage(ctx context.Context, imageID int64) (string, error)
+
+	// 下面两个是**收 pgx.Tx** 的写入原语，只有 #16 的 admin 分支会用（M6）。
+	//
+	// 它们和上面那八个的区别不是「多一个参数」，而是**谁拥有事务**：上面八个自己
+	// Begin/Commit，一次调用就是一次独立的写；下面两个必须被夹在调用方的事务里，
+	// 于是「改数据行」和「写留痕那一行」能落在同一个事务中（§12 判据 ④：
+	// 不带理由时帖子一条都没被改）。
+	//
+	// 把它们列进同一个接口而不是另开一个窄接口，是因为用它们的正是本服务自己 ——
+	// ItemStore 的语义本来就是「帖子业务需要的全部持久化能力」，
+	// 而帖子业务的写入在 M6 之后确实包含「在别人的事务里写」。
+	// （#17 的 admin 分支反而不在这里：它整段走 ItemGovernance，见下面那个接口。）
+	UpdateTx(ctx context.Context, tx pgx.Tx, id int64, p repo.UpdateItemRow) (int64, error)
+	ReplaceImagesTx(ctx context.Context, tx pgx.Tx, itemID int64, paths []string) error
+}
+
+// ItemGovernance 是 #17 那个「admin 删别人的帖子」分支需要的能力。
+//
+// 这个接口只有一个方法，而它**不是**读写 items 的原语 —— 它是一次完整的治理动作：
+// 下架 + 留痕 + 给作者发那条带理由的通知。#43 批量下架、#49 的连带下架、#17 的 admin
+// 分支三处必须是同一份实现（否则「从后台删的会通知、从帖子页删的不通知」）。
+// 那份实现住在 service.Moderation 里，所以这里是一个**服务依赖服务**的接缝，
+// 而不是往 ItemStore 里再加一个 SetStatusTx：
+// 后者会让帖子服务自己拼出一次「删帖但没留痕」的动作，而那正是 M6 要消灭的东西。
+//
+// 反过来 Moderation 不依赖 Item 服务，所以这条边不会构成环。
+//
+// ⚠ 收 pgx.Tx：调用方（Item 服务）开事务、提交事务，这里只负责在那半个事务里
+// 把三件事写完。留痕和业务同事务没有第二种写法。
+type ItemGovernance interface {
+	TakedownByAdmin(ctx context.Context, tx pgx.Tx, adminID, itemID int64,
+		reason string) (taken, notified int, err error)
 }
 
 // DictLookup 是发帖/改帖时校验分类与地点需要的能力。
@@ -69,7 +103,12 @@ type ItemLookup interface {
 
 // Item 是帖子的业务规则：校验、权限、contact 可见性、软删语义、图片删除。
 type Item struct {
+	// tx 只为 #16/#17 的 admin 分支存在：那两条路径要把「改数据行 + 写留痕 + 发通知」
+	// 夹进同一个事务，而事务只能由最外层那个服务开（§12 M6「留痕和业务同事务」）。
+	// 帖主自己的改/删不用它 —— 那些路径上一行 admin_actions 都不写，没有需要同生同死的东西。
+	tx      TxStarter
 	items   ItemStore
+	gov     ItemGovernance
 	dict    DictLookup
 	uploads *Upload
 	match   MatchRunner
@@ -81,12 +120,20 @@ type Item struct {
 	logger   *slog.Logger
 }
 
-func NewItem(items ItemStore, dict DictLookup, uploads *Upload, match MatchRunner,
-	contacts ContactViewLookup, logger *slog.Logger) *Item {
+// NewItem 的依赖顺序就是上面那条链：tx → items → gov → dict → uploads → match → contacts。
+//
+// ⚠ gov 是 M6 加的第 3 个参数，装配时必须传**已经构造好的 Moderation**（router.go 里
+// 那一行的顺序因此动了）。传 nil 不会在启动时报错，只会在 admin 删别人帖子时 panic，
+// 而那条路径一个月走不了几次 —— 所以这里不假装能兜住它，靠 §12 M6 那两条
+// 遍历 admin 路由的测试（TestNonAdminBlockedFromAdminRoutes / TestEveryAdminWriteIsLogged）
+// 把整条 admin 通道真的走一遍。
+func NewItem(tx TxStarter, items ItemStore, gov ItemGovernance, dict DictLookup, uploads *Upload,
+	match MatchRunner, contacts ContactViewLookup, logger *slog.Logger) *Item {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Item{items: items, dict: dict, uploads: uploads, match: match, contacts: contacts, logger: logger}
+	return &Item{tx: tx, items: items, gov: gov, dict: dict, uploads: uploads,
+		match: match, contacts: contacts, logger: logger}
 }
 
 // ---------- 请求/响应形状 ----------
@@ -240,6 +287,9 @@ func (s *Item) Detail(ctx context.Context, viewer *model.User, id int64) (*model
 //
 // found 帖改完会重新跑一次匹配（Match.OnUpdated），lost 帖不会 ——
 // 这个不对称是 §5.8 的规矩在改帖上的延续：lost 方向的匹配任何时候都只算不写。
+//
+// 第三种情况：**admin 改帖一次匹配都不跑**，found 也一样（M6 补的这条分支）。
+// 理由见下面那句 ⚠，它和 §5.8 那条「匹配失败不影响发帖」是两件事。
 func (s *Item) Update(ctx context.Context, actor *model.User, id int64, in UpdateItemInput) (*model.ItemView, error) {
 	d, err := s.items.GetByID(ctx, id)
 	if err != nil {
@@ -271,7 +321,9 @@ func (s *Item) Update(ctx context.Context, actor *model.User, id int64, in Updat
 		return nil, err
 	}
 
-	updated, err := s.items.Update(ctx, id, repo.UpdateItemRow{
+	// 一条 row 建两次用：帖主自己走 pool 版本的 Update，admin 走同事务那条路（见 updateByAdmin）。
+	// 两处传的是**同一个值**，所以「admin 能改的字段」和「帖主能改的字段」不可能在这层走岔。
+	row := repo.UpdateItemRow{
 		Title:          norm.Title,
 		Description:    norm.Description,
 		CategoryID:     in.CategoryID,
@@ -282,7 +334,14 @@ func (s *Item) Update(ctx context.Context, actor *model.User, id int64, in Updat
 		FoundAt:        norm.FoundAt,
 		Contact:        norm.Contact,
 		ImagePaths:     in.ImagePaths,
-	})
+	}
+
+	var updated *model.ItemDetail
+	if asAdmin {
+		updated, err = s.updateByAdmin(ctx, actor.ID, id, row, in.AdminReason)
+	} else {
+		updated, err = s.items.Update(ctx, id, row)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -293,28 +352,78 @@ func (s *Item) Update(ctx context.Context, actor *model.User, id int64, in Updat
 		slog.Bool("as_admin", asAdmin),
 	}
 	if asAdmin {
-		// admin 动别人的数据行是治理动作，级别提到 WARN 并带上理由。
-		// 计划 §4：#16 的 admin 分支必须补写 admin_actions —— 那是 M6 的活，
-		// 但日志这一半现在就要有，否则 M6 之前的这段时间里 admin 改帖完全无痕。
 		attrs = append(attrs, slog.Int64("owner_id", d.UserID), slog.String("reason", in.AdminReason))
 		s.logger.WarnContext(ctx, "item.update_by_admin", attrs...)
 	} else {
 		s.logger.InfoContext(ctx, "item.update", attrs...)
 	}
 
-	// 改准了内容就可能配上一个原本没配上的失主，所以这一步不能只属于 #13。
-	// 传的是**回读出来的那一条**而不是请求体：类型、状态、字典祖先列都只有库里有，
-	// 而匹配方向（found 才写库）和 closed 不通知这两道门槛都在 Match.OnUpdated 里判 ——
-	// 这里无条件调用，规则只有一处，将来加第三种 item_type 也只用改 Match。
+	// ⚠ **admin 改帖不重跑匹配**（计划 §12 那条「#16 改帖时不重跑匹配」）。
+	// 理由不是性能：管理员改一个字（补个错别字、改个地点描述）如果触发一轮新匹配，
+	// 一批 lost 用户就会收到「有人捡到了你的东西」的通知，而那条帖子的主人**并没有
+	// 重新表态** —— 那等于平台替发帖人许诺了一次归属，违反定位原则 1。
+	// 反过来说，帖主自己改帖推通知是对的：那次表态是他做的。
 	//
-	// ⚠ 顺序：必须在 items.Update 提交之后。台账的外键指向 items(id)，
+	// 顺序：必须在 items.Update 提交之后。台账的外键指向 items(id)，
 	// 而 score/breakdown 要按改完的值算；反过来写在事务里，一旦匹配报错就会牵连改帖本身
 	// （§5.8 禁止的那种失败传播）。放在提交后，最坏情况是「帖子改好了、通知没发出去」。
-	s.match.OnUpdated(ctx, updated)
+	//
+	// 传的是**回读出来的那一条**而不是请求体：类型、状态、字典祖先列都只有库里有，
+	// 而匹配方向（found 才写库）和 closed 不通知这两道门槛都在 Match.OnUpdated 里判。
+	if !asAdmin {
+		s.match.OnUpdated(ctx, updated)
+	}
 
 	// 操作者刚刚把 contact 作为请求体的一部分提交上来，所以响应里一定回给他 ——
 	// 否则他改完自己（或别人）的帖子，看到的却是一个 null，会以为改丢了。
 	return s.buildView(ctx, updated, nil, true)
+}
+
+// updateByAdmin 是 #16 的 admin 分支：改字段 + 重建图片 + 写留痕，三件事夹在同一个事务里。
+//
+// 为什么单独立一个方法而不是在 Update 里 if 一下：Update 已经有五步校验，
+// 再叠一段事务闭包就没人能一眼看出**哪几步在事务里**了。而「留痕和业务同事务」
+// 这条纪律恰恰要求它写成一段看得出边界的代码（§12 M6 判据 ④ 断言的就是这条边界）。
+//
+// 帖主自己改帖走的是另一条路（`s.items.Update`，那个方法自己 Begin/Commit），
+// 那条路上**一行 admin_actions 都不写**：自己的帖子自己改，不需要向任何人交代。
+//
+// ⚠ 留痕里那个 owner_id 来自 UpdateTx 的 RETURNING，不是来自请求体，也不是来自
+// 事务开始前那次 GetByID：它是「这一行真正的作者」在这一刻的事实。
+// 那一次点查当然也读到了 user_id，但读的是**可能被并发改过之前**的值 ——
+// 而留痕是这张表唯一的问责入口，它只能写库里认定的那个作者。
+func (s *Item) updateByAdmin(ctx context.Context, adminID, id int64, row repo.UpdateItemRow, rawReason string) (*model.ItemDetail, error) {
+	// 长度在开事务**之前**查。authorizeItemWrite 只保证了非空，没保证 ≤500
+	// （admin_actions.reason 的宽度）；放任超长串走到 Record 那一道，
+	// 得到的是「开了事务、改了字段、又被回滚」，而在这里查得到的是带 field 的 VALIDATION，
+	// 一次数据库往返都不发。
+	reason, err := requireReasonField(adminReasonField, rawReason)
+	if err != nil {
+		return nil, err
+	}
+
+	var ownerID int64
+	if err := runInTx(ctx, s.tx, "service.Item", func(tx pgx.Tx) error {
+		var err error
+		ownerID, err = s.items.UpdateTx(ctx, tx, id, row)
+		if err != nil {
+			return err
+		}
+		// ImagePaths == nil 表示「这次不改图片」，连 DELETE 都不发 —— 和 pool 版本同一个规矩。
+		if row.ImagePaths != nil {
+			if err := s.items.ReplaceImagesTx(ctx, tx, id, *row.ImagePaths); err != nil {
+				return err
+			}
+		}
+		return Record(ctx, tx, adminID, model.ActionItemEdit, model.TargetItem,
+			id, reason, map[string]any{"owner_id": ownerID})
+	}); err != nil {
+		return nil, err
+	}
+
+	// 回读放在事务**外面**：响应要的那份形状（分类名、地点名、作者昵称、封面）
+	// 只有 itemDetailCols 那一串 JOIN 给得出，而它此刻读到的已经是提交后的值。
+	return s.items.GetByID(ctx, id)
 }
 
 // ---------- #17 删帖 ----------
@@ -324,6 +433,11 @@ func (s *Item) Update(ctx context.Context, actor *model.User, id int64, in Updat
 // 软删的理由（§3.1）：物理删除会丢历史，而 item_images / contact_views /
 // item_returns / match_pairs / reports 五张表都用外键指着 items，
 // CASCADE 下去就是一次连带清库。留着行，这些引用全都还有意义。
+//
+// 同一个 URL 后面是两条路：帖主删自己的帖子只有一次 UPDATE，
+// 而 admin 删别人的是一次治理动作（留痕 + 给作者发带理由的通知，和业务同事务）。
+// 后者整段走 Moderation.TakedownByAdmin，所以单条删留下的那一行和 #43 批量下架**同一个形状**
+// （target_id 和 detail.ids 都写），§13 第 10 步那条自检 SQL 的两个分支才都命中得了它。
 func (s *Item) Delete(ctx context.Context, actor *model.User, id int64, adminReason string) error {
 	d, err := s.items.GetByID(ctx, id)
 	if err != nil {
@@ -340,7 +454,23 @@ func (s *Item) Delete(ctx context.Context, actor *model.User, id int64, adminRea
 		return apperr.NewMsg(apperr.CodeItemClosed, "帖子已被删除")
 	}
 
-	if err := s.items.SetStatus(ctx, id, model.ItemStatusDeleted); err != nil {
+	// 两条路径的共同点是把 status 改成 deleted，区别是**有没有留痕**。
+	// 帖主删自己的帖子不需要向任何人交代（那是他在陈述自己的事实），
+	// 而 admin 删别人的是一次治理动作：状态改动、admin_actions 那一行、
+	// 给作者那条带理由的通知，必须一起提交（§12 判据 ④）。
+	//
+	// 所以 admin 分支整段交给治理服务（ItemGovernance 那个接缝），而不是在这里
+	// 自己 SetStatusTx + Record：那三件事的实现全站只有一份，#43 批量下架和
+	// #49 的连带下架用的也是同一份。在这里抄一遍的代价是
+	// 「从后台删的帖子作者会收到通知，从帖子页删的不会」—— 这种差别只有用户能发现。
+	var notified int
+	if asAdmin {
+		var err error
+		notified, err = s.deleteByAdmin(ctx, actor.ID, id, adminReason)
+		if err != nil {
+			return err
+		}
+	} else if err := s.items.SetStatus(ctx, id, model.ItemStatusDeleted); err != nil {
 		return err
 	}
 
@@ -350,13 +480,46 @@ func (s *Item) Delete(ctx context.Context, actor *model.User, id int64, adminRea
 		slog.Bool("as_admin", asAdmin),
 	}
 	if asAdmin {
-		// 同 Update：M6 会在这里补 admin_actions，日志这一半现在就有
-		attrs = append(attrs, slog.Int64("owner_id", d.UserID), slog.String("reason", adminReason))
+		attrs = append(attrs, slog.Int64("owner_id", d.UserID),
+			slog.String("reason", adminReason), slog.Int("notified", notified))
 		s.logger.WarnContext(ctx, "item.delete_by_admin", attrs...)
 	} else {
 		s.logger.InfoContext(ctx, "item.delete", attrs...)
 	}
 	return nil
+}
+
+// deleteByAdmin 是 #17 的 admin 分支：开一个事务，把整次下架交给治理服务。
+//
+// 它做三件事，而且只有第一件是自己的：查理由的长度、开事务、把 tx 交出去。
+// 「下架 + 留痕 + 通知」那一套住在 Moderation.TakedownByAdmin 里（理由见上面那段）。
+//
+// taken 没有回传：能走到这里说明那条帖子确定是 open 或 closed（上面刚判过 deleted），
+// 而那批只有一条 id 的 UPDATE 要么改到、要么整笔事务因为别的错误回滚。
+// notified 要回传，是为了日志里那句「有没有人被告知」—— 排查「他说他没收到通知」时，
+// 这是唯一一条不用查库就能看到的线索。
+func (s *Item) deleteByAdmin(ctx context.Context, adminID, id int64, rawReason string) (notified int, err error) {
+	reason, err := requireReasonField(adminReasonField, rawReason)
+	if err != nil {
+		return 0, err
+	}
+
+	var taken int
+	if err := runInTx(ctx, s.tx, "service.Item", func(tx pgx.Tx) error {
+		var err error
+		taken, notified, err = s.gov.TakedownByAdmin(ctx, tx, adminID, id, reason)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	if taken == 0 {
+		// 走到这里只有一个可能：帖主在刚才那次点查之后、这次事务之前自己把帖子删了。
+		// 不当失败处理 —— 帖子已经不在广场上了，管理员要的结果已经达成，
+		// 而留痕那一行照样写了（#43 对 taken=0 是同一个口径：点了下架这件事本身要可追责）。
+		s.logger.WarnContext(ctx, "item.takedown_already_deleted",
+			slog.Int64("item_id", id), slog.Int64("admin_id", adminID))
+	}
+	return notified, nil
 }
 
 // ---------- #18 开帖/关帖 ----------

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -161,4 +162,146 @@ func scanUser(row pgx.Row) (*model.User, error) {
 		return nil, err
 	}
 	return &u, nil
+}
+
+// ---------- M6：管理员要的那三件事 ----------
+
+// UserFilter 是 #34 GET /api/admin/users 的查询条件。
+//
+// 三个条件全可选，但**语义和 #14 广场那个 ListFilter 不一样**，所以不复用：
+// 广场的默认是「只给 open 的帖子」，这里的默认是**全站所有人**（含 banned）——
+// 「找出这个人」是治理的起点，把被封的人藏起来的话，这一页就不能用来核对封禁记录。
+//
+// Keyword 匹配三个字段（用户名 / 昵称 / 真实姓名）而不是一个：管理员手里的线索
+// 取决于他是在哪看到这个名字的，而这三列在系统里都真实存在、都可能就是他手上那个。
+type UserFilter struct {
+	Keyword  string
+	Role     string
+	Status   string
+	Page     int
+	PageSize int
+}
+
+// ListByFilter 分页取用户，最新注册在前。
+//
+// ⚠ 这一条**没有**行级归属过滤（不像 #19「只看自己的」），因为它返回的正是全站用户，
+// 边界完全由 middleware.RequireAdmin 那道鉴权决定。
+// 所以这里的 SQL 只允许被 #34 那条挂了 RequireAdmin 的路由调用链触达 ——
+// 将来如果有人把 ListByFilter 接到一个普通端点上，那才是要拦的事，
+// 而不是在这里加一个「只有 admin 能调」的参数：repo 不知道调用者是谁，那是分层的纪律。
+//
+// Keyword 走 escapeLike：那个函数是 repo 包里的（M2 给 #14 写的），
+// 它处理的是「用户输入里带 % 或 _」——不转义的话管理员搜「100%」会命中一大片。
+// ILIKE 而不是 LIKE：昵称和真实姓名里可能有大小写混排，管理员不会在意大小写。
+func (r *User) ListByFilter(ctx context.Context, f UserFilter) ([]model.User, int, error) {
+	var (
+		conds []string
+		args  []any
+	)
+	if f.Keyword != "" {
+		args = append(args, "%"+escapeLike(f.Keyword)+"%")
+		k := fmt.Sprintf("$%d", len(args))
+		conds = append(conds, fmt.Sprintf(`(username ILIKE %s OR nickname ILIKE %s OR real_name ILIKE %s)`, k, k, k))
+	}
+	if f.Role != "" {
+		args = append(args, f.Role)
+		conds = append(conds, fmt.Sprintf(`role = $%d`, len(args)))
+	}
+	if f.Status != "" {
+		args = append(args, f.Status)
+		conds = append(conds, fmt.Sprintf(`status = $%d`, len(args)))
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+
+	var total int
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM users`+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("repo.User.ListByFilter 计数: %w", err)
+	}
+
+	limitIdx, offsetIdx := len(args)+1, len(args)+2
+	args = append(args, f.PageSize, (f.Page-1)*f.PageSize)
+
+	// 这里**不带** password_hash：userCols 是给认证路径用的完整行，
+	// 拿它跑这一条会把哈希一起捞进内存，而 #34 一个都不返回。
+	// 单独列一遍清单不是重复，是「这一条查询能泄漏什么」的显式声明。
+	rows, err := r.pool.Query(ctx, fmt.Sprintf(
+		`SELECT id, username, nickname, real_name, auth_source, role, status, credit_score, created_at
+		   FROM users%s ORDER BY created_at DESC, id DESC LIMIT $%d OFFSET $%d`,
+		where, limitIdx, offsetIdx), args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("repo.User.ListByFilter: %w", err)
+	}
+	defer rows.Close()
+
+	out := []model.User{}
+	for rows.Next() {
+		var u model.User
+		if err := rows.Scan(&u.ID, &u.Username, &u.Nickname, &u.RealName,
+			&u.AuthSource, &u.Role, &u.Status, &u.CreditScore, &u.CreatedAt); err != nil {
+			return nil, 0, fmt.Errorf("repo.User.ListByFilter 扫描一行: %w", err)
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("repo.User.ListByFilter 迭代: %w", err)
+	}
+	return out, total, nil
+}
+
+// SetRoleTx 改一个人的角色（#35）。
+//
+// 名字带 Tx、第一个数据参数是 pgx.Tx：这是 M6 整条治理写路径的约定 ——
+// **所有治理写入都必须跑在调用方那个已经开了的事务里**，
+// 因为 service/adminlog.Record 要的正是同一个 tx（那个函数拒绝 nil tx，
+// 也没有第二条路能让留痕和业务分开提交）。
+// 如果这里收 *pgxpool.Pool，「先改库、再另开一条连接补日志」就是可写的，
+// 而那正是风险 14 里唯一防线被拆掉的方式。
+//
+// 返回改完的那一行，而不是只返回 error：#35 的响应要 {id, role}，
+// 而「响应里的 role 来自 UPDATE ... RETURNING」比「来自请求参数」强 ——
+// 前者是数据库真的存下来的值。
+func (r *User) SetRoleTx(ctx context.Context, tx pgx.Tx, id int64, role string) (*model.User, error) {
+	row := tx.QueryRow(ctx, `
+		UPDATE users SET role = $2, updated_at = now() WHERE id = $1
+		RETURNING `+userCols, id, role)
+
+	u, err := scanUser(row)
+	if err != nil {
+		return nil, wrapUserNotFound(err, "SetRoleTx", id)
+	}
+	return u, nil
+}
+
+// SetStatusTx 改一个人的状态（#36，active / banned）。形状和理由同 SetRoleTx。
+//
+// 封号之后那个人的**旧 token 立刻失效**，这件事不在这里做，靠的是
+// middleware.JWT 每个请求都重新读一行 users（见那个文件的注释）。
+// 这一条 UPDATE 只负责写下那个事实， enforcement 是读路径上天然发生的。
+// 把「封号」理解成「让事务里的一次 UPDATE 加上一次即时的 token 撤销」是多余的：
+// 我们这里没有签发任何东西可撤销。
+func (r *User) SetStatusTx(ctx context.Context, tx pgx.Tx, id int64, status string) (*model.User, error) {
+	row := tx.QueryRow(ctx, `
+		UPDATE users SET status = $2, updated_at = now() WHERE id = $1
+		RETURNING `+userCols, id, status)
+
+	u, err := scanUser(row)
+	if err != nil {
+		return nil, wrapUserNotFound(err, "SetStatusTx", id)
+	}
+	return u, nil
+}
+
+// wrapUserNotFound 只在「确实查无此人」时给 NOT_FOUND，其它错误原样包装。
+//
+// 从 r.wrapNotFound 抽成包级函数的原因是 Tx 版本的方法收不到 *User 接收者
+// （它们不碰 pool），而三条治理写路径都要同一句「用户不存在」。
+// 保持和原来一样的判断顺序：连接故障绝不能伪装成 404。
+func wrapUserNotFound(err error, fn string, id int64) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return apperr.WrapMsg(err, apperr.CodeNotFound, "用户不存在")
+	}
+	return fmt.Errorf("repo.User.%s(%d): %w", fn, id, err)
 }

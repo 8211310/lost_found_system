@@ -3,30 +3,34 @@ package repo
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"lostfound/internal/model"
 )
 
-// Notification 管 notifications 表在本里程碑需要的三件事：
-// 收件箱分页读、未读数、标记已读。
+// Notification 管 notifications 表在本里程碑需要的四件事：
+// 收件箱分页读、未读数、标记已读，以及 M6 的**治理回执写入**（InsertTx）。
 //
-// **这里没有写通知的方法**，而且这是刻意的。M3 写 new_match 走的是
-// repo.Match.RecordMatches —— 因为那条 INSERT 必须和 match_pairs 那一行
-// 在同一个事务里（台账写成功、通知没发出去 = 这一对再也不会被重试，
-// 因为 ON CONFLICT 会把它挡掉；反过来通知发了、台账没写 = 下次重复通知）。
-// 那个事务属于「匹配」这件事，不属于「通知」这件事，所以它留在 match.go。
+// 前三个是「读自己那张收件箱」，最后一个不一样，它值得单独解释一次。
 //
-// 如果这里再放一个 Push/Insert 方法，M5 就会有两个地方能写通知，
-// 而「台账和通知是不是原子」这件事就变回靠自觉了。
+// 这个文件在 M4/M5 时**一个写方法都没有**，那是刻意的：那时通知的写入方都在
+// 别的表的事务里 —— M3 的 new_match 住在 repo.Match.RecordMatches（因为通知必须和
+// match_pairs 那一行同生同死，那个事务属于「匹配」），M5 的归还类通知住在
+// repo.ItemReturn 的 Submit/Confirm/Reject 里（通知是那次确认的后果，它必须和
+// 产生它的那件事同事务）。它们的共同点是：**事务属于那件事，而那件事住在 repo**，
+// 所以 INSERT 也住在那儿。如果当时这里再放一个通用 Push/Insert，就会有两个地方
+// 能写通知，而「台账和通知是不是原子」这件事就变回靠自觉。
 //
-// **M5 实际上把归还类通知写在了 repo/item_return.go**（Submit / Confirm / Reject 三个事务里），
-// 而不是回到本文件加一个通用 INSERT —— 通知是那次归还确认的后果，
-// 它必须和产生它的那件事同生同死，所以它住在那件事的文件里。
-// 到这里为止，全站能写 notifications 的位置恰好三个：
-// repo.Match.RecordMatches（new_match）、repo.ItemReturn 的三个动作、
-// 以及 M6 的治理动作。本文件一个都没有。
+// M6 的前提变了：治理动作的**事务属于 service**（计划 §15：moderation 每个方法
+// 第一行 BeginTx、最后一行 Commit，留痕和通知都夹在中间）。这条规则不能为了
+// 保持上面的整洁而破例 —— 「SQL 只出现在 repo 层」是分层纪律里更硬的一条，
+// service 里写 INSERT 是让业务层直接摸数据库。
+// 所以这一层唯一的妥协是：**这个写方法收 pgx.Tx，不收自己开事务的能力**。
+// 它没有 pool 版本，也就是说它**没有**「自己找一条连接顺手提交一次」这条路 ——
+// 治理回执和留痕不同事务这件事在类型上就写不出来。
 type Notification struct {
 	pool *pgxpool.Pool
 }
@@ -168,5 +172,70 @@ func (n *Notification) MarkRead(ctx context.Context, userID int64, ids []int64) 
 		return 0, fmt.Errorf("repo.Notification.MarkRead (user=%d, all=%v, ids=%d 个): %w",
 			userID, ids == nil, len(ids), err)
 	}
+	return int(tag.RowsAffected()), nil
+}
+
+// NewNotice 是一条要写进 notifications 的通知。
+//
+// ItemID / ReturnID 是指针：批量下架那条通知**不挂任何帖子**（它说的是
+// 「你的 50 条帖子被下架了」，挂哪一个都是错的），必须能写成 NULL。
+// 用空串或者 0 都不行 —— 0 不是合法 id，而前端拿到 0 会去请求 /items/0。
+type NewNotice struct {
+	UserID   int64
+	Type     string
+	Title    string
+	Content  string
+	ItemID   *int64
+	ReturnID *int64
+}
+
+// InsertTx 在**调用方的事务**里写一批通知，返回写入的行数。
+//
+// 为什么收 tx 而不是自己用 pool：这是 §12 M6 判据 ④ 的落地方式。
+// 管理员下架 50 条帖子时必须同时做到三件事 —— 帖子变 deleted、留痕一行、
+// 作者收到一条含理由的通知。这三件如果不在同一个事务里，第 ② ③ 件失败时
+// 第 ① 件已经生效了，于是「帖子消失了但没人知道为什么」，而那正是治理最坏的样子。
+// 收 pgx.Tx 让「通知和留痕不同事务」这件事**在类型上写不出来**；
+// 而它没有 pool 版本，所以也没有「service 忘了开事务」这个选项。
+//
+// 批量插一条 SQL 而不是循环发 N 条，理由和 repo.insertImages 完全一样：
+// N 次往返，加上 debug 日志里 N 条看不出所以然的 SQL。
+// 这里 N 是「这批治理动作涉及几个作者」，spam 场景下是 1，但跨作者的批量下架会用到。
+//
+// ⚠ type / title / content 三列的合法值域和长度**这里不校验**：
+// type 的 CHECK（23514）会挡掉拼错的类型名，但 title 100、content 500 这两个长度
+// 撞上是 SQLSTATE 22001（字符串截断），TranslateConstraint 不认它，会变成 500。
+// 所以文案的**拼装和裁剪住在 service/moderation.go**（那边知道 reason 最长 500，
+// 拼上「你的 N 条帖子因『…」被下架」必须算好总长）。这里只负责诚实地写。
+func (n *Notification) InsertTx(ctx context.Context, tx pgx.Tx, notices []NewNotice) (int, error) {
+	if len(notices) == 0 {
+		return 0, nil
+	}
+
+	var (
+		sb   strings.Builder
+		args []any
+	)
+	sb.WriteString(`INSERT INTO notifications (user_id, type, title, content, item_id, return_id) VALUES `)
+	for i, nt := range notices {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d)",
+			len(args)+1, len(args)+2, len(args)+3, len(args)+4, len(args)+5, len(args)+6))
+		args = append(args, nt.UserID, nt.Type, nt.Title, nt.Content, nt.ItemID, nt.ReturnID)
+	}
+
+	tag, err := tx.Exec(ctx, sb.String(), args...)
+	if err != nil {
+		if ae := TranslateConstraint(err); ae != nil {
+			return 0, ae
+		}
+		return 0, fmt.Errorf("repo.Notification.InsertTx (%d 条通知): %w", len(notices), err)
+	}
+	// 用 RowsAffected 而不是 len(notices) 当返回值：这张表没有任何触发器或
+	// ON CONFLICT，两者正常永远相等，但相等是**假设**，而返回值是**观测**。
+	// 调用方拿它当「实际通知了几个人」，将来真出现不等，冒烟测试会红在这里，
+	// 而不是让 service 抱着一个自己算的数写进响应。
 	return int(tag.RowsAffected()), nil
 }

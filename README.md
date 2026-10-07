@@ -174,12 +174,37 @@ REQUIRE_INTEGRATION=1 go test ./...
 这样 `go test ./...` 在任何机器上都不会红。但「全绿」可能意味着一条集成测试都没跑 ——
 所以最终验收必须带这个变量，带了之后「DSN 为空」就直接算**失败**，不是跳过。
 
+### 4b. 测试用的那个库是怎么回事（不熟 SQL 也能看懂）
+
+集成测试**不动你的开发库** `lostfound`，它自己另建一个隔离的库。整件事只有三步：
+
+1. 测试代码拿着上面那个 DSN 连到 PostgreSQL 的**默认库 `postgres`**（注意 DSN 结尾是
+   `/postgres` 而不是 `/lostfound`），在里面执行一句 `CREATE DATABASE lostfound_test`。
+   建库用的是 Go 代码，所以本机不需要 `createdb`，也不需要你手工做任何事。
+2. 建好之后它把 `migrations/` 里所有的 up 文件在这个新库里跑一遍，于是表结构和种子数据
+   和开发库一模一样，然后每个测试开始前 `TRUNCATE` 清空 —— 这是「测试之间零串扰」的意思。
+3. 跑完不会自动删库。库里留着最后一个测试写过的那几行数据，**放着就行** ——
+   下一次跑之前它还会被 `TRUNCATE` 清掉，所以你永远不用担心「测试数据越积越多」。
+
+想亲眼看看它：pgAdmin 4（开始菜单搜）→ 左侧 Servers → PostgreSQL → Databases，
+列表里应该同时有 `lostfound` 和 `lostfound_test`。点开 `lostfound_test` →
+Schemas → public → Tables → 右键 `users` → View Data → 0 Rows，就是刚清空的样。
+
+想彻底删掉它（比如想确认「程序能自己建库」这件事真的成立）：右键 `lostfound_test` →
+**Drop** → 弹窗里把「Drop database?」确认框点 Yes，然后再跑一次上面的集成测试命令，
+它会自动重建。**这不会影响你的开发库**，两者除了在同一台 PostgreSQL 里没有任何关系。
+
+⚠ 只有这一种情况你需要动手：如果报
+`ERROR: database "lostfound_test" does not exist` 之类，说明 `lf` 这个角色没有建库权限，
+回去跑一次 `bash scripts/setup-postgres.sh`（它是幂等的，会补上 `CREATEDB`）。
+
 ### 5. 手工冒烟
 
 后端跑着的时候，另开一个终端：
 
 ```bash
 bash scripts/smoke.sh            # 全部里程碑的判据都跑一遍
+bash scripts/smoke.sh m6         # 只跑 M6（治理与管理后台）
 bash scripts/smoke.sh m5         # 只跑 M5（归还确认 · 积分）
 bash scripts/smoke.sh m3         # 跑 M3，运行器自动补上它依赖的 m1 m2
 bash scripts/smoke.sh --list     # 看有哪些节、谁依赖谁
@@ -195,14 +220,20 @@ bash scripts/smoke.sh --list     # 看有哪些节、谁依赖谁
 | `smoke/m3-match.sh` | #20 | m1 m2 |
 | `smoke/m4-notify.sh` | #21、#22、#30–#32、#41 | m1 m2 m3 |
 | `smoke/m5-return.sh` | #23–#29、#33 | 无（自包含） |
+| `smoke/m6-governance.sh` | #34–#37、#39、#43–#50 | 无（自包含，但**必须有 psql**） |
 
 ⚠ **为什么大部分节不能单独跑**：它们要借用前面节建出来的用户和帖子
 （`$TOKEN`、`$MY_ID`、`$LOC_ID` 这些全局变量），所以必须跟着前面的节一起跑。
 这种借依赖写在每个文件开头的 `# deps:` 一行里，运行器照它自动补齐 ——
 宁可多跑几节，也不要因为 `$TOKEN` 是空的而报一堆假的 401。
-只有 `m5` 是自己注册五个用户、自己发帖、自己传图的，所以只有它真的能单跑。
+目前只有 `m5` 和 `m6` 是自己注册用户、自己发帖、自己传图的，所以只有它们真的能单跑。
 **这条自包含不是为了方便，是为了断言的诚实**：上一版 M5 借的是 M3/M4 留下的数据，
 于是「拾主手上有几条通知」实际测的是「上一节跑出了什么」，改 M4 会让 M5 假红。
+
+`m6` 有一个别节没有的前提：它需要能直接查库。理由是这一节自己建管理员 ——
+`admin_actions` 台账里到底写没写行、写了几个 `ids`，接口上一点都看不出来
+（#50 那个列表本身就是从这张表读的，用它验证它自己等于什么都没验），
+所以**没有 psql 时整节 SKIP**，那不代表治理接口坏了。
 
 它用 curl 打一遍全链路，只断言 `code` 字段，**从不断言 message 文本**
 （message 是给人看的中文，随时可改；code 是稳定的机器码，永不改语义）。
@@ -238,6 +269,7 @@ bash scripts/smoke.sh --list     # 看有哪些节、谁依赖谁
 |---|---|
 | `GET /api/health` | 服务和数据库是否活着 |
 | `GET /api/debug/config` | 当前生效的配置（仅 `ENV=dev` + admin，敏感值打码）（M6） |
+| `GET /api/admin/actions` | 管理动作台账：谁、什么时候、对哪条帖/哪个用户、做了什么、理由原文（M6）—— 出了争议就查这里，它是唯一的事实来源 |
 | `GET /api/items/:id/matches` 的 `breakdown` | 匹配调试器：每个信号的分数和权重都能验算（M3） |
 | Adminer <http://localhost:8081>（路径 A）<br>pgAdmin 4（路径 B，开始菜单搜）<br>`psql -h 127.0.0.1 -U lf -d lostfound` | 直接看表、改数据、试 SQL |
 
@@ -481,10 +513,51 @@ bash scripts/smoke.sh --list     # 看有哪些节、谁依赖谁
 - **冒烟脚本按里程碑拆开了**（M5 验收过程中做的，不是重构癖）：原来那份 1646 行、
   后来 2016 行的单文件没法只跑一节，而上面①②两条假红的根源恰恰是「跨节借数据」。
   现在是 `scripts/smoke.sh`（运行器：选节、按 `# deps:` 补依赖、跑前置检查）
-  + `scripts/smoke/{lib.sh, m0…m5-*.sh}`。选节跑：`bash scripts/smoke.sh m5`；
+  + `scripts/smoke/{lib.sh, m0…m6-*.sh}`。选节跑：`bash scripts/smoke.sh m5`；
   看依赖表：`--list`。
-- **未开工**：
-  M6 治理与管理后台 · M7 前端 · M8 杭电助手 SSO（外部阻塞中）
+- **M6 治理与管理后台 —— 已完成并验收（2026-10-08）**
+  §4 的 #9–#12、#34–#37、#39、#43–#50 共 17 条路由（累计 **50 条 / 最终 50 条**：
+  `planComplete` 已翻成 `true`，`TestFinalRouteCount` 从按设计 SKIP 变成真跑）。
+  字典增删、用户列表 / 改角色 / 封禁解封 / 警告、统计、批量下架与恢复、删图片、
+  删违规归还确认、举报待办与处置、操作日志台账、`debug/config`。
+  验收实测：纯单测（不连库）auth 59 + middleware 15 + router 11 + service **594** +
+  repo 42 + model 5 + matcher 53 = **779 项全绿、0 失败**；
+  集成测试 `smoketest` **592 项全绿**（199 个顶层测试函数，0 FAIL、0 SKIP）；
+  `scripts/smoke.sh` 全量（m0–m6）**572 项全绿、0 跳过**，其中 m6 一节 125 项。
+  §12 那条 spam 主线走通了一遍，几条只有测了才成立的性质：
+  - **「留痕和业务同事务」是编译期性质，不是约定**：`adminlog.Record` 的第二个参数是
+    `pgx.Tx` 而不是 `*pgxpool.Pool` —— 想让一句 SQL 进库就必须先拿到事务，而拿着同一个
+    事务就自动共享了提交与回滚。第①层的 `TestEveryAdminWriteIsLogged` 扫的是
+    「每个写动作都有对应的 action 常量」，第③层扫的是回滚：#43 被拒的三次
+    （缺 reason、`ids:[]`、`ids:[0,-3]`）之后 `items`、`admin_actions`、`notifications`
+    三张表**一行都没多**。
+  - 台账按**动作**数行，不是按对象数行：处置一条举报，走下架写 **2** 行
+    （`report_resolved` + `item_takedown`），维持原状只写 **1** 行。
+    这一条最容易想成「操作了几条帖就几行」。
+  - 批量下架的通知按**作者**合并：五十条 spam 帖都是小陈一个人发的，他只收到 **1** 条
+    「你的 50 条帖子已被下架」；而 `detail.ids` 存了全部 50 个 id、`detail.count` 存 50、
+    `target_id` 存第一个 —— 台账能逐条审计，通知不会变成五十条骚扰。
+  - `role` 和 `status` **都不在 JWT 里**（每个请求重新读 users 那一行），所以提成 admin 后
+    拿着**旧 token** 立刻能用 #37、降回 user 后那 16 条立刻 403；#36 封禁也是同一枚
+    token 立刻 403 `USER_BANNED`。如果 role 在 claim 里，这三条断言会全部假绿。
+  - admin 只有销毁权、没有归属权：#46 只有 `DELETE`，`/api/admin/*` 这个组里
+    没有 confirm / reject / 关帖 / 干预匹配（`TestNoAdminCommunityRoutesExist` 遍历的就是
+    这个**封闭集合**）；`ReviewKindAdminDataFix` 到今天仍然只声明、没有任何写路径。
+  - #39 在生产环境里是**少注册一条路由**（404），不是一个「返回 403 的端点」；
+    dev 里非 admin 403、admin 200 且 `jwt_secret` 打码成 `"***"`。第③层还额外做了一次
+    真值泄漏检查：把 `backend/.env` 里的 `JWT_SECRET` 拿去响应体里搜，
+    只打印响应体长度、绝不打印内容。
+  - ⚠ 这次有**三条红是测试和环境自己的**，产品代码一行都没改：
+    ① 封禁中的 token **连自己的收件箱都读不到**（403 的错误信封里当然没有封号理由原文），
+    于是「通知里有理由原文」假红。改成解封之后再读内容，条数断言留在封禁期间（它们走
+    数据库，不依赖他的 token）。顺带说，这恰好是对的产品行为：解封后他能把整条链读回来。
+    ② `grep -c` 数的是**行数**，而响应体只有一行 —— 用它判「只收到一条通知」会恒为 1，
+    不管实际发了几条。一律改成 `grep -o … | wc -l`。
+    ③ 新注册的端点全是 404：**dev server 是常驻进程，加完路由必须重启**，
+    否则打的是旧二进制。见下面「常见坑」。
+- **待办**：
+  M6+ #58（让作者在 #15/#19 看见自己帖子被下架的理由，读时派生、兼容批量 `detail.ids`）
+  · M7 前端 · M8 杭电助手 SSO（外部阻塞中）
 
 路由清单见 `internal/router/router.go` —— 那是 §4 全部 50 条路由的唯一注册点，
 每个里程碑的占位注释都标了对应的端点编号。
@@ -546,6 +619,20 @@ printf '%s' '{"nickname":"冒烟"}' | curl -X POST .../api/auth/register --data-
 | URL 里的查询参数（`?keyword=冒烟`） | 中文变 `???`，筛选「查不到」—— 而且**搜不到时的断言会假绿** | 冒烟脚本里一律先百分号编码 |
 | `psql -c "…'中文'…"` | 写进库的是 `???`，或按中文匹配永远 0 行 | 脚本里的库级断言只数行数（`count(*)`），不比对中文字面量 |
 | `curl -o 输出文件`（本仓库路径含中文） | 文件根本没被写出来，后续 `head` 报 no such file | 临时文件放 `mktemp -d`（纯 ASCII 路径） |
+
+**改了 `router.go` 加了端点，请求却全返回 404「接口不存在」。** 这不是路由写错了，
+是因为 **dev server 是常驻进程**：`go run ./cmd/server` 把代码编译成二进制后一直跑着，
+之后你改的文件它不会自己重新加载。症状很好认 —— 报的是本项目那条统一的
+`{"code":"NOT_FOUND","message":"接口不存在：GET /api/admin/stats"}`，
+也就是**服务活着、数据库连着、只有这条路由不存在**（它在回答你，说明不是端口的问题）。
+`Ctrl-C` 停掉再 `go run ./cmd/server` 重启就有了。
+冒烟脚本打完前面的节、M6 那节却全 404，先想这一条再想别的。
+
+**冒烟脚本里数出现次数，不能用 `grep -c`。** `grep -c` 数的是**匹配到的行数**，
+而一个 JSON 响应体就是**一行** —— 所以 `grep -c '"content":'` 无论一条还是五十条通知都返回 1，
+「只发了一条通知」这类断言会永远绿。要数出现次数就 `grep -o '模式' | wc -l`（`lib.sh` 里
+M6 用的 `count_in_body` 就是这么写的）。这条坑和上面那条是同一类：**断言写坏了不会报错，
+它只是安静地什么也没测。**
 
 **Go 版本是 1.26.0，计划 §1.2 写的是 1.25.4。** 这是 `GOTOOLCHAIN=auto` 的正常行为：
 scoop 装的是 go 1.25.4，但依赖里 `golang.org/x/text v0.42.0` 要求 `go >= 1.26.0`，

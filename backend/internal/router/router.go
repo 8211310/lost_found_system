@@ -127,7 +127,22 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	notifSvc := service.NewNotification(notifRepo, slog.Default())
 	reportSvc := service.NewReport(reportRepo, itemRepo, slog.Default())
 
-	itemSvc := service.NewItem(itemRepo, dictRepo, uploads, matchSvc, contactRepo, slog.Default())
+	// ---- M6 的服务必须在 itemSvc **之前**装配 ----
+	//
+	// 不是风格问题：#17 的 admin 分支（admin 删别人的帖子）整段复用治理服务那份
+	// 「下架 + 留痕 + 通知」的实现，所以 itemSvc 现在**依赖** modSvc。
+	// 顺序调反不会 panic、不会报错，只会得到一个未定义的标识符 —— 编译期就挡住了，
+	// 这也是这一整段装配写在 router 里而不是 main 里的原因之一（见 Setup 顶部那段）。
+	adminActionRepo := repo.NewAdminAction(pool)
+	statsRepo := repo.NewStats(pool)
+
+	// pool 在这里同时是 TxStarter（`Begin(ctx) (pgx.Tx, error)` 天然满足）。
+	// 传 pool 而不是给治理服务一个 repo：M6 的事务**住在 service 层**（§15），
+	// repo 只提供收 pgx.Tx 的写入原语，谁都不自己开事务。
+	modSvc := service.NewModeration(pool, itemRepo, dictRepo, users, returnRepo,
+		reportRepo, notifRepo, statsRepo, adminActionRepo, uploads, slog.Default())
+
+	itemSvc := service.NewItem(pool, itemRepo, modSvc, dictRepo, uploads, matchSvc, contactRepo, slog.Default())
 
 	// M5 的两条链。returnSvc 依赖四个只读接缝和 returnRepo 这一个写入口：
 	//   - itemRepo 只被当 ItemLookup（只有 GetByID）用，所以归还服务改不了任何帖子；
@@ -254,6 +269,67 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	api.GET("/my/credit-logs", jwt, creditH.MyLogs)
 
 	// ---- M6：治理与管理后台（#9–#12、#34–#37、#39、#43–#50）----
+
+	// 16 条 /api/admin/* 全部挂在这个组上，两条中间件写在组上而不是逐条写：
+	// 漏一条不会编译报错，而「一个非 admin 能调用的治理端点」是这个系统里
+	// 后果最严重的一类 bug（任何人都能下架别人的帖子、封别人的号）。
+	// 顺序必须是 jwt → RequireAdmin：后者读的是前者刚从库里查出来的那一行 users，
+	// role 不进 JWT（见 middleware/admin.go 顶部），所以没有 jwt 就没有 role 可判。
+	//
+	// 这个组存在的另一个作用是它**是一个封闭集合**：治理能力的全部入口就这 16 条，
+	// M6 那条 TestNoAdminCommunityRoutesExist 断言「这个组里没有 confirm/reject/关帖/干预匹配」，
+	// 断言的对象因此是明确的（遍历 Routes() 里前缀为 /api/admin 的那些）。
+	admin := api.Group("/admin", jwt, middleware.RequireAdmin())
+	adminH := handler.Admin{Svc: modSvc}
+
+	// #9–#12 字典。增删都要 reason，而**没有改名**（§14-15：低频，走 Adminer）。
+	admin.POST("/categories", adminH.CreateCategory)       // #9
+	admin.DELETE("/categories/:id", adminH.DeleteCategory) // #10
+	admin.POST("/locations", adminH.CreateLocation)        // #11
+	admin.DELETE("/locations/:id", adminH.DeleteLocation)  // #12
+
+	// #34–#37 用户与统计。
+	admin.GET("/users", adminH.ListUsers)                // #34
+	admin.PUT("/users/:id/role", adminH.SetUserRole)     // #35
+	admin.PUT("/users/:id/status", adminH.SetUserStatus) // #36
+	admin.POST("/users/:id/warn", adminH.WarnUser)       // #47
+	admin.GET("/stats", adminH.Stats)                    // #37
+
+	// #43 #44 帖子下架与恢复。
+	//
+	// ⚠ 这两条是 M6 唯一一处「同一层既有静态段 takedown 又有参数段 :id」，
+	// 也就是本文件开头那条 Gin 路由树陷阱的正面对撞点。做成现在这样是刻意的：
+	// 批量下架的对象列表在 body 里（五十条 spam 点五十次 = 五十个独立事务，
+	// 第 37 次失败时前三十六次已经生效了），所以它不能挂在 :id 下面。
+	// 如果 gin 版本退化到不支持混合兄弟节点，TestNoPanicOnSetup 会红，
+	// 届时改的是这两条路径的形状，而不是偷偷把批量拆成单条。
+	admin.POST("/items/takedown", adminH.TakedownItems)  // #43
+	admin.POST("/items/:id/restore", adminH.RestoreItem) // #44
+
+	// #45 删单张图片。路径里只有图片自己的 id，和 #42 帖主自删那条是同一种形状。
+	admin.DELETE("/item-images/:id", adminH.DeleteImage) // #45
+
+	// #46 删一条违规的归还确认。**只有 DELETE，没有任何 confirm / reject**：
+	// admin 能销毁一行记录，但推进不了社区流程（定位原则 5）。
+	admin.DELETE("/returns/:id", adminH.DeleteReturn) // #46
+
+	// #48 #49 举报待办与处置。
+	admin.GET("/reports", adminH.ListReports)                // #48
+	admin.POST("/reports/:id/resolve", adminH.ResolveReport) // #49
+
+	// #50 操作日志：每一个 admin 都能看其他 admin 做过什么（风险 14 的唯一防线是事后可追责）。
+	admin.GET("/actions", adminH.ListActions)
+
+	// #39 debug/config。⚠ **生产环境里这条路由压根不存在**（404），不是一个「返回 403 的端点」：
+	// 少注册一条路由才是零攻击面，而 handler 里那一道 ENV 检查防的是「这一行 if 被改坏」，
+	// 两道闸各管一种失误，见 handler/debug.go。
+	//
+	// 它挂在 api 上而不是 admin 组里：组的鉴权是 Admin，而这一条要的是 Admin **且** dev，
+	// 多出来的那半个条件由注册分支本身表达。
+	if !cfg.IsProd() {
+		debugH := handler.Debug{Cfg: cfg}
+		api.GET("/debug/config", jwt, middleware.RequireAdmin(), debugH.Get)
+	}
 
 	return e, nil
 }

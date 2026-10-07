@@ -472,6 +472,51 @@ func (r *ItemReturn) Cancel(ctx context.Context, id, submitterID int64) (*Decide
 	return &DecideResult{ItemID: itemID, SubmitterID: submitterID, ReviewedAt: reviewedAt}, nil
 }
 
+// DeletedReturn 是 #46 删掉一行归还确认时**从被删的那一行里**带出来的事实。
+type DeletedReturn struct {
+	ID             int64
+	ItemID         int64
+	SubmitterID    int64
+	Status         string
+	ProofImagePath string
+}
+
+// DeleteTx 物理删除一行归还确认（#46），**在调用方的事务里**。
+//
+// 为什么是**物理**删而不是像 items 那样软删：item_returns 的 status CHECK 里
+// 只有 pending/confirmed/rejected/cancelled 四个值（000001 迁移第 7 节），
+// 第五个值需要改表，而这条端点要处理的正是「刷出来的行根本不该存在」。
+// 软删会把垃圾留在两个人的列表里 —— 提交人的「我提交的」和发帖人的「我收到的」
+// 都得在 SQL 里多带一个「且不是被管理员删的」条件，而那个条件早晚会在某一句里漏掉。
+//
+// ⚠ 必须 RETURNING 出这几列，而且必须在删的**同一条** SQL 里：
+//   - submitter_id → 通知发给谁（§3.7：admin_action 发给**被处置的那个人**，
+//     而归还确认的被处置人是提交人，不是发帖人 —— 发帖人那条待办凭空消失固然奇怪，
+//     但更奇怪的是有人被删了东西却什么都不知道）
+//   - proof_image_path → 磁盘上那张凭证图。这一行没了之后那个路径**再也查不出来**，
+//     不在 RETURNING 里带出来就只能留一个没人认领的文件，而它里面是别人的照片
+//   - item_id → 留痕的 target_id 该指哪条帖子；顺带让通知文案能说清是哪件事
+//   - status → 写进留痕的 detail（删的是一条 pending 还是一条已确认的，
+//     事后追责时是完全不同的两件事）
+func (r *ItemReturn) DeleteTx(ctx context.Context, tx pgx.Tx, id int64) (*DeletedReturn, error) {
+	var d DeletedReturn
+	err := tx.QueryRow(ctx, `
+		DELETE FROM item_returns
+		 WHERE id = $1
+		RETURNING id, item_id, submitter_id, status, proof_image_path`, id).
+		Scan(&d.ID, &d.ItemID, &d.SubmitterID, &d.Status, &d.ProofImagePath)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apperr.WrapMsg(err, apperr.CodeNotFound, "归还确认不存在")
+		}
+		if ae := TranslateConstraint(err); ae != nil {
+			return nil, ae
+		}
+		return nil, fmt.Errorf("repo.ItemReturn.DeleteTx(%d): %w", id, err)
+	}
+	return &d, nil
+}
+
 // illegalTransition 是「0 行受影响」的统一解释。
 //
 // WHERE 里那三个条件（id / status='pending' / 归属）任何一个不成立都会走到这里，

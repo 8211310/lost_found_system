@@ -165,6 +165,7 @@ func setup(dsn string) (*Harness, error) {
 		Pool:   pool,
 		Server: httptest.NewServer(engine),
 		Cfg:    cfg,
+		Engine: engine,
 	}, nil
 }
 
@@ -206,6 +207,12 @@ type Harness struct {
 	Pool   *pgxpool.Pool
 	Server *httptest.Server
 	Cfg    config.Config
+
+	// Engine 是 Server 背后那台**同一个** engine，不是第二次 Setup 的结果。
+	// M6 的权限测试要「遍历所有 /api/admin/* 路由」，而那份清单只能来自
+	// 真正在服务请求的那棵树：自己再 Setup 一次拿到的是复制品，
+	// 将来两处注册不一致时测试会绿着漏掉一条没鉴权的路由。
+	Engine *gin.Engine
 }
 
 func (h *Harness) Close() {
