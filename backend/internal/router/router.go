@@ -142,7 +142,7 @@ func Setup(cfg config.Config, pool *pgxpool.Pool) (*gin.Engine, error) {
 	modSvc := service.NewModeration(pool, itemRepo, dictRepo, users, returnRepo,
 		reportRepo, notifRepo, statsRepo, adminActionRepo, uploads, slog.Default())
 
-	itemSvc := service.NewItem(pool, itemRepo, modSvc, dictRepo, uploads, matchSvc, contactRepo, slog.Default())
+	itemSvc := service.NewItem(pool, itemRepo, modSvc, dictRepo, uploads, matchSvc, contactRepo, adminActionRepo, slog.Default())
 
 	// M5 的两条链。returnSvc 依赖四个只读接缝和 returnRepo 这一个写入口：
 	//   - itemRepo 只被当 ItemLookup（只有 GetByID）用，所以归还服务改不了任何帖子；

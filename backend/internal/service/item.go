@@ -60,6 +60,19 @@ type ItemGovernance interface {
 		reason string) (taken, notified int, err error)
 }
 
+// TakedownLookup 是「向作者解释这条帖子为什么不见了」需要的**只读**能力。
+//
+// 它的唯一实现是 repo.AdminAction.LatestTakedowns（一次查一批，返回 map）。
+// 之所以单独开一个接口而不是塞进 ItemStore：ItemStore 的语义是「帖子业务需要的
+// 持久化能力」，而这件事的数据根本不在 items 表里 —— 它在 admin_actions 那本登记簿里，
+// 是**治理**的记录。把它单列出来，读这段代码的人就不会以为 items 上有一列 reason。
+//
+// ⚠ 接口里只有读，没有任何写。所以帖子服务在类型层面就写不出「解释的时候顺手改一下台账」，
+// 而台账唯一的写入口仍然是 service/adminlog.Record（收 pgx.Tx，和业务同事务）。
+type TakedownLookup interface {
+	LatestTakedowns(ctx context.Context, itemIDs []int64) (map[int64]repo.TakedownInfo, error)
+}
+
 // DictLookup 是发帖/改帖时校验分类与地点需要的能力。
 //
 // 单独一个接口而不是复用 DictTrees：建树要的是全量行，校验要的是单行点查，
@@ -117,10 +130,16 @@ type Item struct {
 	// M4 加了 #21 之后，这一格必须接上，否则 found 帖的 contact 对全世界永远是 null，
 	// 而定位原则 2 说的恰恰是「联系方式是能联系到本人的唯一选项」。
 	contacts ContactViewLookup
-	logger   *slog.Logger
+	// takedowns 只为两件解释性的读存在：#15（作者读自己被下架的那条）和
+	// #19（作者翻「我的发布」里 deleted 那一栏）。它不写任何东西，
+	// 也不参与任何业务判断 —— 少了它这两个端点**照样返回 200**，
+	// 只是那几行少了「为什么」这句话。所以传 nil 是合法的、也是安全的：
+	// 装配漏了它不会 panic，只会退回到 M6 那个「看得见被删、说不出原因」的状态。
+	takedowns TakedownLookup
+	logger    *slog.Logger
 }
 
-// NewItem 的依赖顺序就是上面那条链：tx → items → gov → dict → uploads → match → contacts。
+// NewItem 的依赖顺序就是上面那条链：tx → items → gov → dict → uploads → match → contacts → takedowns。
 //
 // ⚠ gov 是 M6 加的第 3 个参数，装配时必须传**已经构造好的 Moderation**（router.go 里
 // 那一行的顺序因此动了）。传 nil 不会在启动时报错，只会在 admin 删别人帖子时 panic，
@@ -128,12 +147,12 @@ type Item struct {
 // 遍历 admin 路由的测试（TestNonAdminBlockedFromAdminRoutes / TestEveryAdminWriteIsLogged）
 // 把整条 admin 通道真的走一遍。
 func NewItem(tx TxStarter, items ItemStore, gov ItemGovernance, dict DictLookup, uploads *Upload,
-	match MatchRunner, contacts ContactViewLookup, logger *slog.Logger) *Item {
+	match MatchRunner, contacts ContactViewLookup, takedowns TakedownLookup, logger *slog.Logger) *Item {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Item{tx: tx, items: items, gov: gov, dict: dict, uploads: uploads,
-		match: match, contacts: contacts, logger: logger}
+		match: match, contacts: contacts, takedowns: takedowns, logger: logger}
 }
 
 // ---------- 请求/响应形状 ----------
@@ -274,7 +293,27 @@ func (s *Item) Detail(ctx context.Context, viewer *model.User, id int64) (*model
 	// 他当然可以从 Adminer 里看到 contact 列，但那是「数据库增删改查」，
 	// 走 API 这条路不该给他一个绕过解锁记录的通道 —— 否则 contact_views
 	// 这份审计日志就不再完整了（定位原则 5）。
-	return s.buildView(ctx, d, viewer, false)
+	v, err := s.buildView(ctx, d, viewer, false)
+	if err != nil {
+		return nil, err
+	}
+
+	// 「为什么不见了」这句话只对**作者本人**说（2026-10-07 用户新增的需求）。
+	//
+	// admin 读同一条帖子时这里**不填**：他不是需要一个说法的人，而 #50 那本登记簿
+	// 里本来就有同一句话的完整版（带操作者昵称、带 detail）。两处都给就会出现
+	// 「同一个事实两个地方两份」，将来一改一不改就再也对不上了。
+	//
+	// 排在最后、而且只在 deleted 时发这一次查询：open/closed 的帖子读得最多，
+	// 它们一行登记簿都不该扫。
+	if d.Status == model.ItemStatusDeleted && viewer != nil && viewer.ID == d.UserID {
+		r, err := s.removalFor(ctx, d.ID)
+		if err != nil {
+			return nil, err
+		}
+		v.Removal = r
+	}
+	return v, nil
 }
 
 // ---------- #16 改帖 ----------
@@ -611,6 +650,13 @@ func (s *Item) ListMine(ctx context.Context, userID int64, q ListQuery) (*Page[m
 	for i := range rows {
 		list = append(list, rows[i].Summary(&rows[i].Contact, s.uploads.URL(rows[i].CoverPath)))
 	}
+
+	// 被 admin 下架的那几行，在这里向作者解释为什么（见 attachRemovals 的注释：
+	// 只有 deleted 的行会被收集，而且整页只查一次）。
+	// 这一步放在**返回之前**而不是分页查询之前，所以它不影响 total、不影响翻页。
+	if err := s.attachRemovals(ctx, list); err != nil {
+		return nil, err
+	}
 	return &Page[model.ItemSummary]{List: list, Total: total, Page: f.Page, PageSize: f.PageSize}, nil
 }
 
@@ -798,4 +844,77 @@ func canSeeDeleted(viewer *model.User, ownerID int64) bool {
 		return false
 	}
 	return viewer.ID == ownerID || viewer.IsAdmin()
+}
+
+// ---------- 「为什么不见了」：读时派生 ----------
+
+// removalFor 查一条帖子最近一次被下架的留痕。查不到就返回 nil，
+// 而 nil 在响应里的表现是**没有 removal 这个键**（model 那边带 omitempty）。
+//
+// ⚠ 「查不到」有两种完全不同的原因，而这里一律当成同一件事处理：
+//   - 这条帖子的 deleted 不是 admin 造成的（帖主自己 #18 删的）—— 那确实没有说法要给；
+//   - 登记簿查询本身坏了 —— 那会被下面的 error 分支带到 handler 变成 INTERNAL。
+//
+// 分清这两件事靠的是「err 是不是 nil」，不是靠 map 里有没有这个 key：LatestTakedowns
+// 查询失败时返回的是 (nil, err)，不是 (空 map, nil)。所以「查不到」和「没查成功」
+// 在类型层面就不会混 —— 这是这个方法可以只写三行的原因。
+func (s *Item) removalFor(ctx context.Context, id int64) (*model.RemovalView, error) {
+	if s.takedowns == nil {
+		return nil, nil
+	}
+	m, err := s.takedowns.LatestTakedowns(ctx, []int64{id})
+	if err != nil {
+		return nil, err
+	}
+	return removalOf(m, id), nil
+}
+
+// removalOf 从一批结果里取这一条帖子那一份，没有就返回 nil。
+func removalOf(m map[int64]repo.TakedownInfo, id int64) *model.RemovalView {
+	t, ok := m[id]
+	if !ok {
+		return nil
+	}
+	return model.NewRemovalView(t.ActionID, t.Reason, t.CreatedAt)
+}
+
+// attachRemovals 给一页「我的发布」里 deleted 的那几行挂上下架理由。
+//
+// 两个刻意的设计：
+//
+//  1. **只收集 deleted 的 id**。open/closed 的行不查、也不该查 —— 它们没被下架过，
+//     而每一次多余收集都是一次没有意义的登记簿扫描。
+//     这一条是能被测的（第①层那个 fake 记下自己收到了哪些 id），所以它不是注释里的
+//     愿望，是判据。
+//  2. **整页只查一次**，不是每行查一次。一页 20 行里有 15 行是 deleted 的话，
+//     逐行查就是 15 次登记簿扫描，而这一层脚本里传的是**一批 id**，一次就够。
+//     （批量下架本来就是这功能最主要的使用场景 —— 一次 spam 处置就是几十条。）
+//
+// 传进来的是一页的**切片**而不是 Page 结构体：它只改元素，不改长度、不改 total，
+// 所以签名里没有任何翻页信息，也就没有「改错了页码」这种错误可犯。
+func (s *Item) attachRemovals(ctx context.Context, list []model.ItemSummary) error {
+	if s.takedowns == nil || len(list) == 0 {
+		return nil
+	}
+
+	ids := make([]int64, 0, len(list))
+	for i := range list {
+		if list[i].Status == model.ItemStatusDeleted {
+			ids = append(ids, list[i].ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	m, err := s.takedowns.LatestTakedowns(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		if r := removalOf(m, list[i].ID); r != nil {
+			list[i].Removal = r
+		}
+	}
+	return nil
 }

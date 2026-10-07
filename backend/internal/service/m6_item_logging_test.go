@@ -79,6 +79,10 @@ type itemFakes struct {
 	begins int
 
 	detail *model.ItemDetail
+	// listRows 是 #14/#19 那两条列表路径的种子数据（service 只会把它转成摘要再返回）。
+	// 默认 nil —— 这份文件自己的用例全是**写**路径，一次列表都不走；
+	// 用它的用例是 m6plus_removal_test.go 那一组。
+	listRows []model.ItemDetail
 
 	poolUpdates int
 	// poolStatuses 记下帖主自删那条路把状态改成了什么 —— 判据 ④ 要的正是「一条都没改」。
@@ -124,8 +128,11 @@ func (f *itemFakes) SetStatus(_ context.Context, _ int64, status string) error {
 	return nil
 }
 
+// List 返回种子行。total 就用 len —— 这两行**必须**保持一致，
+// 否则 #19 的分页会算错，而 #58 那一组用例关心的是「哪几行被拿去查登记簿」，
+// 不是「翻页对不对」（后者是 M2 那组列表用例的职责）。
 func (f *itemFakes) List(context.Context, repo.ListFilter) ([]model.ItemDetail, int, error) {
-	return nil, 0, nil
+	return f.listRows, len(f.listRows), nil
 }
 
 func (f *itemFakes) ListImages(context.Context, int64) ([]model.ItemImage, error) { return nil, nil }
@@ -189,7 +196,11 @@ func newItemServices(t *testing.T) (*Item, *itemFakes, *govFakes) {
 	if err != nil {
 		t.Fatalf("建临时上传目录失败：%v", err)
 	}
-	return NewItem(f, f, newModeration(t, g), f, uploads, f, f, testLogger), f, g
+	// takedowns 传 nil 是有意的：这三个用例走的是 #16/#17/#18 三条**写**路径，
+	// 一条都没有读「为什么被下架」。传 nil 恰好把这条边界钉住 ——
+	// 如果哪天 Item 服务在写路径上调了它，这里会立刻 panic 在测试里，
+	// 而不是等到 #58 那个解释性读功能上线时才发现多了一条隐形的登记簿依赖。
+	return NewItem(f, f, newModeration(t, g), f, uploads, f, f, nil, testLogger), f, g
 }
 
 type itemCase struct {

@@ -119,7 +119,51 @@ type ImageView struct {
 	SortOrder int    `json:"sort_order"`
 }
 
+// RemovalView 是「这条帖子为什么不见了」里**能给作者看**的那部分。
+//
+// 它不是 items 表上的列，而是读的时候从 admin_actions 那本登记簿里现查出来的
+// （repo.AdminAction.LatestTakedowns，理由写在那个方法的注释里）：
+// 只留一份事实来源，就不会出现「台账被改过、帖子上那一列还是旧的」这种
+// 两处对不上、而给用户的那个说法恰好错了的状态。
+//
+// ⚠ 这个结构体里**永远不该出现**的三样东西，都是刻意的：
+//   - 操作者的身份或昵称：作者需要知道的是「为什么」，不是「谁」。把具体的人
+//     暴露给被处置者，治理纠纷就变成私人恩怨；全站能安全地看「哪个 admin 干了什么」
+//     的地方是 #50，那是给**其他 admin**看的。
+//   - 举报条数：这个数字会被拿去猜是谁举报的，而且它把「平台记录事实」
+//     变成了「平台替你数了票数」（定位原则 1）。
+//   - 举报人是谁：举报入口的设计前提就是举报人对被举报者匿名。
+//
+// ActionID 是给作者报修用的：他来问「我帖子怎么没了」时报这个数，
+// 后台一步就能定位到那一行登记；不给的话只能靠时间和标题去猜是哪一次。
+type RemovalView struct {
+	ActionID  int64  `json:"action_id"`
+	Reason    string `json:"reason"`
+	CreatedAt string `json:"created_at"`
+}
+
+// NewRemovalView 把一行下架留痕转成对外形状。
+//
+// 存在的唯一理由是**时间格式化的纪律只准住在一个地方**：所有出口一律先转 UTC
+// 再按 RFC3339 序列化（见下面 formatTimeValue 那段）。如果让调用方自己
+// `t.UTC().Format(time.RFC3339)`，就会有第二份、第三份这种代码散在 service 里，
+// 而「哪天统一改成立刻时间」这件事就会变成一次全仓库搜索。
+//
+// 三个参数而不是收 repo.TakedownInfo：model 不准 import repo（依赖只能往下走）。
+func NewRemovalView(actionID int64, reason string, createdAt time.Time) *RemovalView {
+	return &RemovalView{
+		ActionID:  actionID,
+		Reason:    reason,
+		CreatedAt: formatTimeValue(createdAt),
+	}
+}
+
 // ItemView 是 #15 GET /api/items/:id 的 data 形状，也是 #13/#16 响应里 item 字段的形状。
+//
+// ⚠ Removal 带 **omitempty**，这不是为了省带宽：它让「没有留痕」（绝大多数情况就是
+// 作者自己删的）表现为**这个键根本不出现**，而不是出现一个 null。这件事只有一种
+// 解释方式（有说法 / 没这回事），而「removal 存在但里面是空的」是不该存在的第三种。
+// 前端因此只需要问「removal 在不在」，不需要再问「它有没有内容」。
 //
 // Contact 是**指针**，这是整个 M2 最关键的一处类型选择：
 // 计划 §4「#15 的 contact 可见性规则」要求锁着的时候返回 `contact: null`，
@@ -147,6 +191,10 @@ type ItemView struct {
 	Author         AuthorView  `json:"author"`
 	CreatedAt      string      `json:"created_at"`
 	UpdatedAt      string      `json:"updated_at"`
+	// Removal 只在「读者是作者本人 且 这条现在是 deleted」时才由 service 填上，
+	// 而且只有**查到了下架留痕**才填 —— 自己删的帖子不显示任何说法，因为没有任何
+	// 人对它做过任何事。填充逻辑住在 service.Item.Detail，不在 View() 里（model 不查库）。
+	Removal *RemovalView `json:"removal,omitempty"`
 }
 
 // ItemSummary 是列表类端点（#14 广场、#19 我的发布，以及 M3 之后的 #20 匹配结果、
@@ -179,6 +227,12 @@ type ItemSummary struct {
 	AuthorID     int64   `json:"author_id"`
 	AuthorName   string  `json:"author_name"`
 	CreatedAt    string  `json:"created_at"`
+	// Removal 和 ItemView 上那一个是同一件事，但只有 #19（我的发布）会填：
+	// 下架那一刻发的那条 admin_action 通知会被读完、被后面的新消息翻过去，
+	// 而这个列表一直在 —— 所以「为什么不见了」这句话需要一个不会被时间翻过去的落点。
+	// #14 广场永远不带它：那一页的状态白名单里压根没有 deleted（item_validate.go 的
+	// publicListStatus），而且治理信息不该出现在公开响应里。
+	Removal *RemovalView `json:"removal,omitempty"`
 }
 
 // View 把一行 ItemDetail 转成详情形状。

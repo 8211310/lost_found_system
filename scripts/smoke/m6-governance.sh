@@ -28,6 +28,9 @@ section "M6 治理 #34–#37、#39、#43–#50（§12 spam 主线 + §13 第 8�
 #   ⑥ #49 的留痕按**动作**数：takedown 2 行、dismiss 1 行；两个举报人各收一条回执；
 #      被举报人收到的是「帖子被下架」而不是「有人举报了你」
 #   ⑦ §13 第 10 步那两条收尾自检 SQL 在我们的数据上都是 0 行
+#   ⑧ #58 作者侧的说法：批量下架的那 50 条**每条**都带着同一句理由
+#      （page=1 和 page=50 分别取自 detail.ids 和 target_id 那两支，action_id 必须相同），
+#      #44 恢复之后这句跟着消失，帖主自删的那条压根没有这句
 
 M6_P="correct-horse-battery"
 M6_TAG="m6$(date +%s)$RANDOM"
@@ -232,6 +235,49 @@ check '   通知内容里有理由原文' "$M6_REASON" "$BODY"
 check '   也有「50 条」这个数字（合并的那条必须说清范围）' '你的 50 条帖子' "$BODY"
 check '   item_id 是 null：一批帖子没有单一对应的帖子页' '"item_id":null' "$BODY"
 
+# ---------- #58：作者侧「为什么不见了」，第 1 条和第 50 条都得有同一句 ----------
+#
+# 判据③ 刚钉过「一次批量下架只写 1 行台账」。那 50 个 id 里只有第一个住在 target_id
+# 这一列，其余 49 个藏在 detail->'ids' 那个 JSONB 数组里 ——
+# 「每个帖子都有说法」要求读的那份 SQL 把数组摊平回一行一个 id。
+#
+# 为什么非要按页取**首尾两条**，而不是数一遍 removal 在这页出现了几次：
+# 数次数分辨不出两种完全相反的错误 ——
+#   ① 只 JOIN target_id → removal 出现 1 次，另外 49 条无声消失；
+#   ② 给整页挂同一个对象（把「这条的理由」写成「这批的理由」）→ 正好出现 50 次，看着最像对的。
+# 这 50 条的 created_at 是循环里一条条插进去的，所以 page=50 是最早那一条
+# （= ids[0] = 台账的 target_id，走第一支）、page=1 是最新那一条（只能从 detail.ids 找回，
+# 走第二支）。两条**分别**取到理由、而且 action_id 相同，才同时排除 ① 和 ②。
+#
+# ⚠ 数值断言一律走 check_re 加 ^...$ 锚，不用 check：check 是子串匹配，
+#   「期望 1 实际 10」「期望 50 实际 500」都会假绿，而这里数的正是这些数字。
+req GET '/api/my/items?status=deleted&page_size=100' '' "$M6_chen_TOK"
+check_re '#58 作者侧 #19 能看到 50 条 deleted' '"total":50,' "$BODY"
+check_re '   整页 removal 出现 50 次（一条不落）' '^50$' "$(count_in_body '"removal":')"
+check_re '   理由原文也各出现 50 次' '^50$' "$(count_in_body "$M6_REASON")"
+check_re '   响应里没有 admin_id / real_name / report_id 这三个键（各 0 次）' '^0$' \
+  "$(printf '%s' "$BODY" | grep -oE '"(admin_id|real_name|report_id)"' | wc -l | tr -d '[:space:]')"
+
+M6_REM_IDS=()
+for M6_PAGE in 1 50; do
+  req GET "/api/my/items?status=deleted&page_size=1&page=$M6_PAGE" '' "$M6_chen_TOK"
+  check "#58 page=$M6_PAGE（$([[ $M6_PAGE == 1 ]] && echo '最新那条，只能走 detail.ids' || echo '最早那条，走 target_id')）→ HTTP 200" '200' "$STATUS"
+  check_re '   这一条带 removal，且只带 1 次' '^1$' "$(count_in_body '"removal":')"
+  check '   理由原文逐字在这一条里' "$M6_REASON" "$BODY"
+  check_re '   removal 里恰好三个键' '"action_id":[0-9]+,"reason":"'"$M6_REASON"'","created_at":"[^"]+"' "$BODY"
+  M6_REM_IDS+=("$(jval "$BODY" '"action_id":([0-9]+)')")
+done
+# 两个 action_id 必须相同、且必须是数字（jval 抠不到时是空串，空串 == 空串也会「相同」）。
+if [[ "${M6_REM_IDS[0]}" =~ ^[0-9]+$ && "${M6_REM_IDS[0]}" == "${M6_REM_IDS[1]}" ]]; then
+  printf '  %sPASS%s 首尾两条挂的是同一行台账（action_id=%s —— 那一次批量动作）\n' \
+    "$GREEN" "$RESET" "${M6_REM_IDS[0]}"
+  pass=$((pass+1))
+else
+  printf '  %sFAIL%s 首尾两条的 action_id 是 [%s] 和 [%s]，期望同一个数字\n' \
+    "$RED" "$RESET" "${M6_REM_IDS[0]}" "${M6_REM_IDS[1]}"
+  fail=$((fail+1))
+fi
+
 # ---------- #34 用户列表：治理侧的入口 ----------
 # 四个用户的用户名都以 $M6_TAG 开头，所以 ?q= 这一条能给出一个**精确**的 4，
 # 不受开发库里其他轮次的残留影响。
@@ -253,6 +299,20 @@ check '   再恢复一次 → HTTP 400（只有 deleted 的帖子能被恢复，
 check '     错误指向 id' '"field":"id"' "$BODY"
 check '   留痕 1 行 item_restore' '1' "$(m6_log item_restore)"
 check '   恢复**不发**通知（§3.7 那四种触发里没有它）' '1' "$(notif_type "$M6_chen_ID" admin_action)"
+
+# ---------- #58 的另一半：恢复之后那句理由跟着消失 ----------
+#
+# 台账里那行 item_takedown **仍然在**（恢复抹不掉治理历史，上面刚数过 1 行 item_restore），
+# 所以「removal 不见了」只能是因为这一行不再是 deleted，而不是因为历史被删了。
+# 这一步测的是 service 里那道 `status == deleted` 的门槛 ——
+# 少了它，一条已经重新公开的帖子会一直挂着「因为广告被下架过」的标签。
+req GET '/api/my/items?page_size=100' '' "$M6_chen_TOK"
+check '#58 恢复的那条回到默认页（open 也看得见）' '"status":"open"' "$BODY"
+check_re '   整页 removal 出现 0 次' '^0$' "$(count_in_body '"removal":')"
+req GET "/api/items/$M6_FIRST" '' "$M6_chen_TOK"
+check '   #15 详情同样是 open' '"status":"open"' "$BODY"
+check_re '   详情里也没有 removal（正面前提：这条响应不是错误信封）' '"id":'"$M6_FIRST" "$BODY"
+check_re '   removal 出现 0 次' '^0$' "$(count_in_body '"removal":')"
 
 # ---------- §13 第 8 步的封号那一半：#36 ----------
 # 正面前提：封之前他的小屋接口是通的。
@@ -438,6 +498,33 @@ check '③ 有留痕但没有对象的批量下架不存在（detail.ids 里每�
             AND EXISTS (
               SELECT 1 FROM jsonb_array_elements(a.detail->'ids') AS e(id)
               WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.id = (e.id)::bigint))")"
+
+# ---------- #58 补：帖主自己删的那条，没有理由可给 ----------
+#
+# 这一段放在两条收尾自检**之后**，不是随手：它会新造一条 deleted 的帖子，
+# 而自检② 「本轮用户名下每条 deleted 都要查得到留痕」对帖主自删天生误报
+# （自删不写台账，那是他在处理自己的东西，不是被治理）。
+# 所以要么让它最后跑，要么给自检 SQL 加例外 —— 后者是把产品判据改去迁就测试。
+#
+# 它测的是「查不到」和「不该查」的分界：如果实现是「凡是 deleted 就编一句解释」，
+# 上面所有断言都还是绿的，而这里会红 —— 因为作者会看到一句系统自己造出来的话。
+req POST /api/items "{\"item_type\":\"found\",\"title\":\"$M6_TAG self delete\",\"description\":\"$M6_TAG my own post\",\"category_id\":$M6_CAT,\"location_id\":$M6_LOC,\"found_at\":\"$M6_T_FOUND\",\"contact\":\"wx_m6_spam\"}" "$M6_chen_TOK"
+M6_SELF="$(itemIDOf "$BODY")"
+if [[ ! "$M6_SELF" =~ ^[0-9]+$ ]]; then
+  printf '  %sFAIL%s 没能建出小陈自己那条待自删的帖（取到的 id 是 [%s]），#58 自删段测不了\n' "$RED" "$RESET" "$M6_SELF"
+  fail=$((fail+1))
+  return 0
+fi
+req DELETE "/api/items/$M6_SELF" '' "$M6_chen_TOK"
+check '#18 帖主自删自己刚发的那条 → HTTP 200' '200' "$STATUS"
+check '   库里是 deleted' 'deleted' "$(item_status "$M6_SELF")"
+check_re '   没有为它写任何一行留痕（自删不是治理动作）' '^0$' \
+  "$(db "SELECT count(*) FROM admin_actions a WHERE a.target_type='item'
+          AND (a.target_id=$M6_SELF OR a.detail->'ids' @> to_jsonb(${M6_SELF}::bigint))")"
+req GET "/api/items/$M6_SELF" '' "$M6_chen_TOK"
+check_re '   #15 本人读得到这条（正面前提：响应是那条帖子本身，不是错误信封）' '"id":'"$M6_SELF" "$BODY"
+check '   状态是 deleted' '"status":"deleted"' "$BODY"
+check_re '   但 removal 一次都没出现（没有台账行，就没有可给的说法）' '^0$' "$(count_in_body '"removal":')"
 
 printf '%s开发库里留下了本轮的治理冒烟数据（用户名都以 %s 开头，小陈名下 50 条帖、9 行留痕）。%s\n' \
   "$DIM" "$M6_TAG" "$RESET"
