@@ -116,7 +116,7 @@ func TestSetupRegistersExactlyTheExpectedRoutes(t *testing.T) {
 // TestFinalRouteCount 是计划 §10 那条「断言条数 == 50」的落点。
 func TestFinalRouteCount(t *testing.T) {
 	if !planComplete {
-		t.Skip("计划还没走完（当前 18 条）；M6 收尾时把本文件的 planComplete 改成 true，这条测试就会开始要求 50 条")
+		t.Skip("计划还没走完（当前 19 条）；M6 收尾时把本文件的 planComplete 改成 true，这条测试就会开始要求 50 条")
 	}
 	if len(expectedRoutes) != 50 {
 		t.Fatalf("§4 规定最终是 50 条路由，expectedRoutes 里现在有 %d 条", len(expectedRoutes))

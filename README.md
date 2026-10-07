@@ -295,8 +295,14 @@ bash scripts/smoke.sh
     封面由 #14 的 `LEFT JOIN LATERAL ... ORDER BY sort_order LIMIT 1` 现算，不需要「重算封面」的代码。
   - admin 改别人的帖**必须带 `admin_reason`**，且改不动作者 —— 归属是改不了的（原则 5）。
 - **M3 匹配 —— 已完成并验收（2026-10-07）**
-  §4 的 #20、#44 两条新路由（累计 20 条 / 最终 50 条）+ `internal/matcher`
+  §4 的 #20 一条新路由（累计 19 条 / 最终 50 条）+ `internal/matcher`
   （字符 bigram + Dice 相似度、Tier1/Tier2 两套加权打分）。
+  ⚠ **对计划 §12 的一处更正**：那一节把 M3 写成「#20、#44 两条端点」，可 `#44` 是
+  §4 里的「批量恢复」（M6 的治理端点），匹配功能从头到尾**只有 #20 一条对外端点**——
+  「建 found 帖时同步匹配并通知」不是路由，是 `POST /api/items`（#13）内部的一步，
+  改帖重匹配同理是 #16 内部的一步（对外只有 `match.run` 日志里的
+  `trigger=found_created` / `found_updated` 可观测）。
+  §4 那张 50 行的表是权威，端点数一律从它数，不从里程碑小结倒推。
   验收实测：纯单测（不连库）auth 59 + middleware 15 + router 7 + service 305 +
   repo 42 + model 5 + matcher 53 = **481 项全绿**（另有 `router` 里 1 项
   `TestFinalRouteCount` **按设计 SKIP**，凑满 50 条路由那天才启用）；
