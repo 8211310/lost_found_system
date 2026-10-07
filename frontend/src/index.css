@@ -1,0 +1,546 @@
+/* src/index.css —— 手写样式，不引组件库。
+   移动优先：失物招领的真实场景是学生在手机上翻广场，所以断点从窄往宽写。 */
+
+:root {
+  --fg: #16181d;
+  --fg-muted: #5c6470;
+  --bg: #f4f5f7;
+  --card: #ffffff;
+  --line: #dfe2e8;
+  --primary: #2563eb;
+  --primary-dark: #1d4ed8;
+  --danger: #b42318;
+  --danger-bg: #fdecea;
+  --radius: 10px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+}
+
+.brand {
+  font-weight: 700;
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.nav a {
+  color: var(--fg-muted);
+  text-decoration: none;
+}
+
+.nav a:hover,
+.nav a.active {
+  color: var(--primary);
+}
+
+.who {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--fg-muted);
+}
+
+.link-btn {
+  border: 0;
+  background: none;
+  color: var(--primary);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+
+.app-main {
+  flex: 1;
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px;
+  margin-bottom: 16px;
+}
+
+.card h1 {
+  margin: 0 0 14px;
+  font-size: 19px;
+}
+
+.field {
+  margin-bottom: 14px;
+}
+
+.field label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 14px;
+  color: var(--fg-muted);
+}
+
+input,
+textarea,
+select {
+  width: 100%;
+  padding: 10px 12px;
+  font: inherit;
+  color: var(--fg);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+  border-color: var(--primary);
+}
+
+.btn {
+  display: inline-block;
+  padding: 10px 16px;
+  font: inherit;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--fg);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--primary-dark);
+}
+
+/* 计划 §M7：拍照/上传入口必须显眼 —— 大、全宽，不藏在小弹窗底部 */
+.btn-block {
+  display: block;
+  width: 100%;
+  padding: 14px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.alert {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.notice {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #eef4ff;
+  color: #194a91;
+}
+
+.muted {
+  color: var(--fg-muted);
+  font-size: 14px;
+}
+
+.hint {
+  margin: 6px 0 0;
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+.req-id {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 6px 12px;
+  margin: 0 0 16px;
+}
+
+.kv dt {
+  color: var(--fg-muted);
+  font-size: 14px;
+}
+
+.kv dd {
+  margin: 0;
+}
+
+@media (min-width: 720px) {
+  .app-main {
+    padding: 24px;
+  }
+}
+
+/* ---------- 片 2：广场列表、详情、匹配表、举报弹层 ---------- */
+
+.type-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.tab {
+  flex: 1;
+  padding: 8px 10px;
+  font: inherit;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.tab-on {
+  border-color: var(--primary);
+  background: #eef4ff;
+  color: var(--primary-dark);
+  font-weight: 600;
+}
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+  margin-bottom: 14px;
+}
+
+.filter-row .field {
+  margin-bottom: 0;
+}
+
+.grow {
+  flex: 1;
+  min-width: 180px;
+}
+
+.cascader {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cascader-part {
+  flex: 1;
+  min-width: 140px;
+}
+
+.item-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+
+.item-card {
+  border-top: 1px solid var(--line);
+}
+
+.item-card > a {
+  display: flex;
+  gap: 12px;
+  padding: 12px 0;
+  color: inherit;
+  text-decoration: none;
+}
+
+.item-cover {
+  width: 68px;
+  height: 68px;
+  flex: 0 0 68px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.item-cover-empty {
+  display: grid;
+  place-items: center;
+  color: var(--fg-muted);
+  font-size: 12px;
+  border: 1px dashed var(--line);
+}
+
+.item-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.item-title {
+  font-weight: 600;
+}
+
+.item-meta {
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+.item-contact {
+  color: var(--primary-dark);
+  font-size: 13px;
+}
+
+.item-tags {
+  display: flex;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+
+.tag {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid var(--line);
+  color: var(--fg-muted);
+}
+
+.tag-lost {
+  background: #fff4e5;
+  border-color: #f0c48a;
+  color: #8a5310;
+}
+
+.tag-found {
+  background: #eaf7ef;
+  border-color: #9fd4b4;
+  color: #1d6b3a;
+}
+
+.tag-closed,
+.tag-deleted {
+  background: var(--bg);
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.detail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.detail-head h1 {
+  margin-bottom: 0;
+}
+
+/* 计划 §M7：举报入口要**弱**。所以它是普通文字颜色的按钮，不是红色图标。 */
+.report-link {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg-muted);
+  text-decoration: underline;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.gallery {
+  list-style: none;
+  margin: 14px 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.gallery-img {
+  width: 100%;
+  height: 150px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.description {
+  white-space: pre-wrap;
+  margin: 0 0 16px;
+}
+
+.contact-value {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+
+/* dt/dd 被包进 div 只是为了能加 key，布局必须回到父级的 grid 上。
+   漏了这一行，详情页那两个时间行会各占一整列，看起来像排版坏了。 */
+.kv-pair {
+  display: contents;
+}
+
+.match-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.match-hit {
+  margin-bottom: 18px;
+}
+
+.match-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  margin: 0 0 6px;
+}
+
+.match-score {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+
+.signals {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.signals th,
+.signals td {
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.signals th {
+  color: var(--fg-muted);
+  font-weight: 600;
+}
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 24, 32, 0.45);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.sheet {
+  width: 100%;
+  max-width: 560px;
+  max-height: 88vh;
+  overflow-y: auto;
+  background: var(--card);
+  border-radius: 14px 14px 0 0;
+  padding: 16px 18px 22px;
+}
+
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sheet-head h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.sheet-close {
+  border: 0;
+  background: none;
+  font-size: 22px;
+  line-height: 1;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.reasons {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 0 0 14px;
+}
+
+.reasons legend {
+  padding: 0 6px;
+  font-size: 14px;
+  color: var(--fg-muted);
+}
+
+.reason {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 3px 0;
+}
+
+.reason input {
+  width: auto;
+}
+
+@media (min-width: 720px) {
+  .sheet-backdrop {
+    align-items: center;
+  }
+
+  .sheet {
+    border-radius: 14px;
+  }
+}

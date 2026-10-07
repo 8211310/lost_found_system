@@ -1,0 +1,228 @@
+// src/pages/ItemDetailPage.tsx —— #15 详情 + #21 解锁 + #41 举报入口 + #20 匹配面板。
+//
+// 这一页是整套「只记录事实、不裁决归属」设计在 UI 上的落点，所以三处文案是判据不是装饰：
+//   ① contact 是否显示**完全由后端决定**（本人 / 已解锁 / lost 帖公开），前端只读 contact_locked；
+//   ② 解锁按钮的轻提示必须说清「认领只是登记，不排他」，否则用户以为锁定了自己的认领权（§2.3）；
+//   ③ 举报入口要弱，成功文案不许诺任何后果（见 ReportDialog 顶部那段）。
+//
+// 后端 #15 挂的是 OptionalJWT：认得出就多给一点，认不出绝不 401。
+// 所以这一页在未登录时也必须能完整渲染 —— 不要在这里放 RequireAuth。
+import { useCallback, useEffect, useState } from 'react'
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { getItem, unlockContact } from '../api/items'
+import { errorText, requestIdOf } from '../api/errorText'
+import { useAuth } from '../auth/AuthContext'
+import { localMinute } from '../lib/time'
+import MatchPanel from '../components/MatchPanel'
+import ReportDialog from '../components/ReportDialog'
+import type { ItemView } from '../api/types'
+
+/** 详情页要显示的时间行，按类型挑列。
+ *  lost 两个（最后确认还在 / 发现丢失）、found 一个（实际拾获）。
+ *  这三个键和数据库那三个具名列一一对应 —— 计划 §3.2 说「列名就是最好的注释」，
+ *  在 UI 上也成立：标签写对了，用户就不会把上传时间当成拾获时间填。 */
+function timeRows(item: ItemView): Array<[string, string]> {
+  if (item.item_type === 'lost') {
+    return [
+      ['最后确认还在', localMinute(item.last_seen_at)],
+      ['发现丢失', localMinute(item.lost_at)],
+    ]
+  }
+  return [['实际拾获时间', localMinute(item.found_at)]]
+}
+
+export default function ItemDetailPage() {
+  const { id = '' } = useParams()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const { status, user } = useAuth()
+
+  const [item, setItem] = useState<ItemView | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [errorId, setErrorId] = useState('')
+
+  // 解锁是这一页唯一的写操作，它的结果只活在这一次访问里：
+  // contact 一旦拿到就显示出来，但**不写进任何缓存**，也不改 item state ——
+  // 那份 state 是后端给的真相，前端替它「补上联系方式」会让下一次刷新和这次不一致。
+  const [unlocked, setUnlocked] = useState<string | null>(null)
+  const [unlockHint, setUnlockHint] = useState('')
+  const [unlocking, setUnlocking] = useState(false)
+  const [reportOpen, setReportOpen] = useState(false)
+
+  useEffect(() => {
+    let dead = false
+    setLoading(true)
+    getItem(id)
+      .then((res) => {
+        if (dead) return
+        setItem(res)
+        setError('')
+      })
+      .catch((err) => {
+        if (dead) return
+        setError(errorText(err))
+        setErrorId(requestIdOf(err))
+      })
+      .finally(() => {
+        if (!dead) setLoading(false)
+      })
+    return () => {
+      dead = true
+    }
+  }, [id])
+
+  /** 去做一件需要身份的事：匿名先跳登录，登录后回本页（from 带过去）。
+   *  这就是 §13 第 4 步里「小李登录 → 解锁」那条路径的前端形态。 */
+  const needAuth = useCallback(() => {
+    if (status === 'authed') return true
+    navigate('/login', { state: { from: location.pathname + location.search } })
+    return false
+  }, [navigate, status, location.pathname, location.search])
+
+  async function onUnlock() {
+    if (!needAuth()) return
+    setUnlocking(true)
+    setError('')
+    try {
+      const res = await unlockContact(id)
+      setUnlocked(res.contact)
+      setUnlockHint(
+        res.already_unlocked
+          ? '你之前已经查看过这条联系方式。认领只是登记，不会阻止其他人联系发布者。'
+          : '认领只是登记，不会阻止其他人联系发布者。',
+      )
+    } catch (err) {
+      setError(errorText(err))
+      setErrorId(requestIdOf(err))
+    } finally {
+      setUnlocking(false)
+    }
+  }
+
+  if (loading && !item) return <p className="muted">正在加载…</p>
+
+  if (!item) {
+    return (
+      <section className="card">
+        <h1>看不了这条帖子</h1>
+        <p className="alert" role="alert">
+          {error || '不知道哪里出了问题'}
+          {errorId && <span className="req-id">（请求编号 {errorId}）</span>}
+        </p>
+        <p className="muted">
+          <Link to="/">回广场</Link>
+        </p>
+      </section>
+    )
+  }
+
+  const contact = item.contact ?? unlocked
+  // #20 的鉴权是「本人或 Admin」（router.go 那段注释交代了为什么这里不用 OptionalJWT 给空列表）。
+  // role 是每次请求现读数据库的（middleware/jwt.go），所以这里的 user.role 不可能是过期的 admin 身份。
+  const canSeeMatches = status === 'authed' && (user?.role === 'admin' || user?.id === item.author.id)
+
+  return (
+    <>
+      <section className="card">
+        <div className="detail-head">
+          <h1>{item.title}</h1>
+          {/* 入口要弱：一个小小的文字按钮。计划 §M7 明确写了「不是醒目的红色图标」——
+              醒目的举报按钮等于鼓励用举报解决问题，而它解决不了任何事。 */}
+          <button
+            className="report-link"
+            type="button"
+            onClick={() => {
+              if (needAuth()) setReportOpen(true)
+            }}
+          >
+            举报
+          </button>
+        </div>
+
+        <p className="item-tags">
+          <span className={`tag tag-${item.item_type}`}>{item.item_type === 'lost' ? '失物' : '拾物'}</span>
+          {item.status === 'closed' && <span className="tag tag-closed">已归还</span>}
+          {item.status === 'deleted' && <span className="tag tag-deleted">已被管理员下架</span>}
+        </p>
+
+        {item.images.length > 0 ? (
+          <ul className="gallery">
+            {item.images.map((img) => (
+              <li key={img.id}>
+                <img className="gallery-img" src={img.url} alt={item.title} loading="lazy" />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted">发布者没上传图片。</p>
+        )}
+
+        <dl className="kv">
+          <dt>分类</dt>
+          <dd>{item.category.name}</dd>
+          <dt>地点</dt>
+          <dd>{item.location.name}</dd>
+          {item.location_detail && (
+            <>
+              <dt>具体位置</dt>
+              <dd>{item.location_detail}</dd>
+            </>
+          )}
+          {timeRows(item).map(([label, value]) =>
+            value ? (
+              <div className="kv-pair" key={label}>
+                <dt>{label}</dt>
+                <dd>{value}</dd>
+              </div>
+            ) : null,
+          )}
+          <dt>发布者</dt>
+          <dd>{item.author.nickname}</dd>
+          <dt>发布于</dt>
+          <dd>{localMinute(item.created_at)}</dd>
+        </dl>
+
+        <h2>描述</h2>
+        {/* 后端原样返回用户写的换行（model.ItemView 的注释里交代过为什么），
+            HTML 默认会把换行吃掉，所以这里必须 white-space: pre-wrap，
+            否则用户会看到「我明明分了段，页面挤成一坨」。 */}
+        <p className="description">{item.description}</p>
+
+        <h2>联系方式</h2>
+        {contact ? (
+          <>
+            <p className="contact-value">{contact}</p>
+            {unlockHint && <p className="hint">{unlockHint}</p>}
+          </>
+        ) : item.contact_locked ? (
+          <>
+            <p className="muted">
+              平台不提供站内私信。拾主留的联系方式要认领之后才看得到 ——
+              这是登记，不是排他锁定。
+            </p>
+            <button className="btn btn-primary" type="button" onClick={onUnlock} disabled={unlocking}>
+              {unlocking ? '正在登记…' : '认领并查看联系方式'}
+            </button>
+          </>
+        ) : (
+          <p className="muted">这条帖子没有联系方式。</p>
+        )}
+
+        {error && (
+          <p className="alert" role="alert">
+            {error}
+            {errorId && <span className="req-id">（请求编号 {errorId}）</span>}
+          </p>
+        )}
+      </section>
+
+      {/* 匹配结果只有发帖人和 admin 读得到（#20 的鉴权是「本人或 Admin」），
+          所以入口对其他人**根本不出现**，而不是点下去吃一个 FORBIDDEN。
+          顺手也省掉了一次注定失败的请求。 */}
+      {canSeeMatches && <MatchPanel itemId={item.id} />}
+
+      {reportOpen && <ReportDialog itemId={item.id} onClose={() => setReportOpen(false)} />}
+    </>
+  )
+}
