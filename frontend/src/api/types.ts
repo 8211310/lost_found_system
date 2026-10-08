@@ -489,3 +489,184 @@ export interface NotificationView {
   is_read: boolean
   created_at: string
 }
+
+/* ---------- 片 6：管理后台（#34–#37、#43–#44、#47–#50） ---------- */
+
+/** #34 的 status / #36 的取值，和 model.UserStatus* 两个常量一一对应。
+ *  ⚠ 库里只有这两种，**没有**「封禁到某年某月」这种东西：整个 schema 里没有任何封号到期列，
+ *  封号就是 indefinite，直到另一个 admin 调 #36 解封。所以页面上不许出现「封 7 天」这种选项，
+ *  也不许在通知文案里承诺「N 天后自动恢复」。 */
+export type UserStatus = 'active' | 'banned'
+
+/** #34 列表里的一行 —— **9 个键，和 UserView 不是同一个形状**。
+ *
+ * 比 #3 多一个 status（管理员找人的一个目的就是核对这个人被封了没有），
+ * 少 phone / email / avatar_url（model/user.go:119-131 那段注释是权威说法：
+ * 一页 20 行铺满手机号等于把 §3.4 的解锁纪律从后台绕过去）。
+ * 所以这一页不许出现「复制他的联系方式」那种便利小动作 —— 数据根本就没给，
+ * 而「给不出来」正是这条契约的防线本身。
+ * username / real_name 是 string（后端把 NULL 折成空串），SSO 用户的 username 就是空的。 */
+export interface AdminUserRow {
+  id: number
+  username: string
+  nickname: string
+  real_name: string
+  auth_source: string
+  role: string
+  status: UserStatus
+  credit_score: number
+  created_at: string
+}
+
+/** #35 的 data。 */
+export interface SetRoleResult {
+  id: number
+  role: string
+}
+
+/** #36 的 data。 */
+export interface SetStatusResult {
+  id: number
+  status: UserStatus
+}
+
+/** #47 的 data。
+ *  ⚠ `notified` 是后端写死的 true（service/moderation.go:1082-1090），
+ *  它的含义是「 INSERT 和这次 200 是同一个事务」，不是「他真的看到了这条通知」。
+ *  页面上可以写「已发送」，不许写「他已收到」。 */
+export interface WarnResult {
+  id: number
+  notified: boolean
+}
+
+/** #37 的 data，七组计数。三个键名只有读过后端才会想到：
+ *  ① `hduhelp` 是 JSON 键，Go 那边那个字段叫 SSO（model/stats.go:60-63 明写「以后端为准」）；
+ *  ② `items_count` **没有 total**（View() 里刻意摘掉的），所以这一组里不许显示「总共多少条帖」；
+ *  ③ `returns_count` **没有 cancelled**：用户自己撤掉的那一类对治理没有信息量。
+ * `today_items_count` 的「今天」用的是 `date_trunc('day', now())`，按**数据库会话时区**切，
+ *  不是 UTC 也不是浏览器时区 —— 所以那一格的标签必须带上「按数据库时区」，
+ *  否则凌晨跨界时会出现「统计页说今日 3 条、日志页三条都不是今天」这种看着像 bug 的事。 */
+export interface AdminStats {
+  users_count: { total: number; local: number; hduhelp: number; banned: number }
+  items_count: { lost: number; found: number; open: number; closed: number; deleted: number }
+  returns_count: { pending: number; confirmed: number; rejected: number }
+  contact_views_count: number
+  reports_count: { open: number; resolved: number; dismissed: number }
+  admin_actions_count: number
+  today_items_count: number
+}
+
+/** #43 的 data。两个数**可以不相等，相等反而是巧合**：
+ *  taken_down 是「真的从非 deleted 翻成 deleted 的条数」，notified_users 是「几位作者收到合并通知」。
+ *  同一批 id 连点两次，第二次是 0/0 且**仍然写一行留痕** —— 那是幂等，不是失败，
+ *  所以这一页拿到 0 的时候不许报错，要说明「这批都已经是下架状态了」。 */
+export interface TakedownResult {
+  taken_down: number
+  notified_users: number
+}
+
+/** #44 的 data。status **恒为 "open"**：恢复只回 open，不会因为下架前是 closed 就回 closed。
+ *  零通知（被下架的人不会因为帖子被放回而收到任何消息）。 */
+export interface RestoreResult {
+  id: number
+  status: string
+}
+
+/** reports.status 的三种取值（迁移里那条 CHECK 的镜像）。
+ *  注意它和 #49 请求体里的 `resolution` 是两套值，别混：takedown 和 ban 都让行变 resolved。 */
+export type ReportStatus = 'open' | 'resolved' | 'dismissed'
+
+/** #49 的三种处置结论。它只决定**管理员做了什么动作**，不代表平台认定举报成立（§3.7 的措辞纪律）。 */
+export type ReportResolution = 'takedown' | 'ban' | 'dismiss'
+
+/** #48 列表里的一行。
+ *  ⚠ `reporter` 只在这一条端点上存在（reports.reporter_id 那一列的注释是「除 admin 外对任何人不可见」），
+ *  所以这个类型只能用在管理后台里，一旦被抄进 #15/#22 那类页面的响应类型就是越权设计。
+ *  ⚠ `report_count_on_item` 数的是**这条帖子当前待处理（status=open）的举报条数**，
+ *  而且那一支相关子查询不受分页影响（SQL 里的别名就叫 open_count_on_item），所以它不是「本页几条」；
+ *  「含这一条自己」只在**这一行本身还是 open** 时成立 —— 一条已处置的行上它可以是 0。
+ *  Go 那个字段叫 OpenCountOnItem，键名不一样。它不等于「被举报过几次」（那种历史在 reports_count 里），
+ *  而且次数高的排前面这件事**只能在前端做**（后端按 created_at DESC 排，不是按热度）。
+ *  `detail` 是举报人自己填的补充，**空串而不是 null**。 */
+export interface AdminReportRow {
+  id: number
+  item: { id: number; title: string; status: string }
+  reporter: { id: number; nickname: string }
+  reason_code: ReportReasonCode
+  detail: string
+  status: ReportStatus
+  report_count_on_item: number
+  created_at: string
+}
+
+/** #49 的 data。`resolved_at` 是**非空字符串**（RFC3339 UTC）。 */
+export interface ResolveReportResult {
+  id: number
+  status: ReportStatus
+  resolved_at: string
+}
+
+/** admin_actions.action 的十二种取值：那是迁移里一条 CHECK 的内容，
+ *  写错一个字母在查询参数上只会安静地返回空列表，所以这一份镜像同时当白名单用。 */
+export type AdminActionName =
+  | 'item_takedown'
+  | 'item_restore'
+  | 'image_takedown'
+  | 'return_takedown'
+  | 'item_edit'
+  | 'user_ban'
+  | 'user_unban'
+  | 'user_role_change'
+  | 'warning_sent'
+  | 'report_resolved'
+  | 'dict_create'
+  | 'dict_delete'
+
+/** admin_actions.target_type 的七种取值。⚠ 没有 "admin_action"：留痕不作用于留痕，
+ *  所以「撤销一次下架」这件事在系统里表现为**新写一行 item_restore**，而不是改掉原来那行。 */
+export type AdminTargetType = 'item' | 'item_image' | 'item_return' | 'user' | 'report' | 'category' | 'location'
+
+/** #50 里那个 detail。
+ *
+ * 后端给的是 `json.RawMessage`，并且约定**永远是一个 JSON 对象**（列是 JSONB NOT NULL DEFAULT '{}'，
+ * 空的时候 View() 补 "{}"，model/admin_action.go:165-177）—— 所以这里不会是字符串也不会是 null，
+ * axios 解出来就是对象。键随 action 不同，全部标可选：
+ * item_takedown 用 ids/count（#49 触发时多 report_id/resolution），
+ * item_restore 用 author_id，image_takedown 用 item_id，
+ * return_takedown 用 item_id/submitter_id/previous_status，
+ * user_role_change 用 role，user_ban/user_unban 用 status（经 #49 时多 report_id/item_id），
+ * warning_sent 是**空对象**，report_resolved 用 report_id/resolution/also_closed，
+ * dict_create 用 name/level（一级的 parent_id 这个键**压根不出现**），dict_delete 用 name/level。 */
+export interface AdminActionDetail {
+  ids?: number[]
+  count?: number
+  report_id?: number
+  resolution?: ReportResolution
+  also_closed?: number[]
+  item_id?: number
+  author_id?: number
+  submitter_id?: number
+  previous_status?: string
+  status?: string
+  role?: string
+  name?: string
+  level?: number
+  parent_id?: number | null
+}
+
+/** #50 日志里的一条留痕。
+ *  ⚠ `admin` 是**指针**：做这件事的那个账号已经被删掉时给 null（SQL 用 LEFT JOIN +
+ *  `(u.id IS NULL) AS admin_missing` 判，不是靠昵称空串猜）。那一行**不会被藏掉** ——
+ *  「留痕还在、做它的人已注销」本身就是其他 admin 需要看到的信息。
+ *  ⚠ 排序是 `created_at DESC, id DESC`，那个 id 兜底是必需的：#49 一次处置在同一个事务里
+ *  写两行、created_at 完全相同，少了它就分不清「先下架、再记处置」。 */
+export interface AdminActionRow {
+  id: number
+  admin: { id: number; nickname: string } | null
+  action: AdminActionName
+  target_type: AdminTargetType
+  target_id: number
+  reason: string
+  detail: AdminActionDetail
+  created_at: string
+}

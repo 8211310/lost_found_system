@@ -4,6 +4,10 @@
 // 这里如果再返回 JSON 字符串，body 会变成一层带引号的字符串，
 // 于是 isEnvelope 判 false，测试表现出「解包器把成功当成透传」这种很难猜的假象。
 import type {
+  AdminActionRow,
+  AdminReportRow,
+  AdminStats,
+  AdminUserRow,
   CategoryNode,
   ContactViewEntry,
   CreditHistory,
@@ -279,3 +283,77 @@ export function sampleNotification(overrides: Partial<NotificationView> = {}): N
     ...overrides,
   }
 }
+
+/* ---------- 片 6：管理后台 ---------- */
+
+/** #34 的一行：**9 个键，和 UserView 不是同一个形状**。
+ *  夹具刻意**没有** phone / email / avatar_url 那三列可给 ——
+ *  给了就等于允许「后台顺手显示联系方式」那种页面在测试里也过得了。 */
+export function sampleAdminUser(overrides: Partial<AdminUserRow> = {}): AdminUserRow {
+  return {
+    id: 12,
+    username: 'xiaoli',
+    nickname: '小李',
+    real_name: '李雷',
+    auth_source: 'local',
+    role: 'user',
+    status: 'active',
+    credit_score: 100,
+    created_at: '2026-10-05T01:00:00Z',
+    ...overrides,
+  }
+}
+
+/** #37 的七组计数。两组数字之间是有等式的，夹具按等式给，所以「把一组当总量」那种错读
+ *  在断言里就撞得上：users 的 local 28 + hduhelp 13 = total 41，
+ *  items 的 lost 50 + found 37 = open 60 + closed 17 + deleted 10 = 87。
+ *  ⚠ 这里**没有** items_count.total 和 returns_count.cancelled 那两个键：
+ *  后端 View() 刻意摘掉了它们（model/stats.go:82-91），夹具补上就会掩盖那条契约。 */
+export function sampleAdminStats(overrides: Partial<AdminStats> = {}): AdminStats {
+  return {
+    users_count: { total: 41, local: 28, hduhelp: 13, banned: 2 },
+    items_count: { lost: 50, found: 37, open: 60, closed: 17, deleted: 10 },
+    returns_count: { pending: 6, confirmed: 12, rejected: 4 },
+    contact_views_count: 33,
+    reports_count: { open: 5, resolved: 9, dismissed: 3 },
+    admin_actions_count: 21,
+    today_items_count: 3,
+    ...overrides,
+  }
+}
+
+/** #48 的一行。默认是 **待处理、且这条帖子上还有 2 条待处理举报**：
+ *  这一页的主用法就是「哪条积得最多」，忘覆盖的测试会落在那条分支上。
+ *  ⚠ 那个数是「当前 open 的条数」（含这一条自己，仅限它自己还 open），不是「被举报过的总次数」。
+ *  detail 是空串而不是 null（举报人没填补充），reporter 只在这条端点上有。 */
+export function sampleAdminReport(overrides: Partial<AdminReportRow> = {}): AdminReportRow {
+  return {
+    id: 901,
+    item: { id: 202, title: '捡到黑色长款钱包', status: 'open' },
+    reporter: { id: 12, nickname: '小李' },
+    reason_code: 'spam',
+    detail: '',
+    status: 'open',
+    report_count_on_item: 2,
+    created_at: '2026-10-07T07:00:00Z',
+    ...overrides,
+  }
+}
+
+/** #50 的一条留痕。默认是批量下架那一种（detail 带 ids），admin 是有值的那种。
+ *  ⚠ detail 永远是对象：列是 JSONB NOT NULL DEFAULT '{}'，空的时候后端补 "{}"，
+ *  所以这一族里「没有细节」长的是 `{}` 而不是 null —— 夹具必须照抄那个空对象而不是给 null。 */
+export function sampleAdminAction(overrides: Partial<AdminActionRow> = {}): AdminActionRow {
+  return {
+    id: 5001,
+    admin: { id: 7, nickname: '管理员' },
+    action: 'item_takedown',
+    target_type: 'item',
+    target_id: 202,
+    reason: '同一账号批量发布广告帖',
+    detail: { ids: [202], count: 1 },
+    created_at: '2026-10-07T08:00:00Z',
+    ...overrides,
+  }
+}
+

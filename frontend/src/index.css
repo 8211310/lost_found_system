@@ -961,3 +961,187 @@ select:focus {
   color: var(--primary-dark);
   font-weight: 600;
 }
+
+/* ---------- 片 6：管理后台 ----------
+   这一族全是「一行一件事 + 一句后果」的清单，不是数据表格：
+   手机上（真实场景）一张八列的表会横向滚，而管理员要在里面做判断，
+   判断需要的东西必须和那一行贴在一起，不能让他左右对着读。 */
+
+.adm-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+
+.adm-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+
+.adm-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  margin: 0;
+}
+
+.adm-name {
+  font-weight: 600;
+}
+
+.adm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin: 0;
+}
+
+/* 展开在某一行之下的那个表单：左边一条竖线，让人看清它属于上面哪一行。 */
+.adm-form {
+  border-left: 3px solid var(--primary);
+  padding-left: 12px;
+  margin: 6px 0 2px;
+}
+
+/* 理由 / 说明这类「原样来自人写的一句话」的段落：不许把换行吃掉，
+   也不许被当成样式文本 —— 留痕里存的就是那份原文。 */
+.adm-reason {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.adm-detail {
+  margin: 0;
+  font-size: 14px;
+  color: var(--fg-muted);
+}
+
+.adm-raw {
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.adm-raw code {
+  display: block;
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border-radius: 6px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.tag-admin {
+  background: #fff4e5;
+  border-color: #f0c48a;
+  color: #8a5310;
+  font-weight: 600;
+}
+
+/* 「这条帖子上几条待处理」是这一页的排序依据，所以它得有颜色，不能和别的灰标签一样重。 */
+.tag-hot {
+  background: var(--danger-bg);
+  border-color: #f0b4ab;
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* 批量下架那一页的两栏：窄屏上下堆叠（先列表后理由），宽屏才并排。
+   顺序很重要 —— 并排时人是「勾完再写理由」，堆叠时同样是先看列表。 */
+.adm-split {
+  display: grid;
+  gap: 16px;
+  margin: 8px 0 14px;
+}
+
+@media (min-width: 900px) {
+  .adm-split {
+    grid-template-columns: 1.4fr 1fr;
+    align-items: start;
+  }
+}
+
+.adm-group {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 12px 10px;
+  margin: 0 0 10px;
+}
+
+.adm-group legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-weight: 600;
+  padding: 0 4px;
+}
+
+.adm-group legend label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-weight: 600;
+}
+
+.adm-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.adm-items label {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.adm-items input[type='checkbox'] {
+  width: auto;
+}
+
+/* 「按下去会发生什么」的那句预览：它是这一页存在的理由，所以给它边框，
+   不是又一段可有可无的说明文字。 */
+.adm-preview {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  margin: 0 0 10px;
+  font-size: 14px;
+}
+
+.adm-preview-head {
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.adm-preview ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.adm-rule {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 18px 0;
+}
+
+.adm-single {
+  border-top: 1px solid var(--line);
+  padding: 12px 0;
+}
+
+.adm-single h2 {
+  font-size: 16px;
+  margin: 0 0 6px;
+}

@@ -1,10 +1,11 @@
 // src/App.tsx —— 页面外壳 + 路由表。
 //
 // 路由表就是里程碑的进度表：广场、详情、发帖改帖删帖、「我的」那一族四页、
-// 归还确认流（详情/两个列表/提交）、通知中心已经通，
+// 归还确认流（详情/两个列表/提交）、通知中心、管理后台（一页五个页签）已经通，
 // 后面每一片往里加，没做的不放链接（放着就是死链）。
 import { Link, Route, Routes, useLocation } from 'react-router-dom'
 import { RequireAuth } from './auth/RequireAuth'
+import { RequireAdmin } from './auth/RequireAdmin'
 import { useAuth } from './auth/AuthContext'
 import { getUnreadCount } from './api/notifications'
 import { onUnreadCountChanged } from './api/unreadBus'
@@ -23,6 +24,7 @@ import MyReturnsPage from './pages/MyReturnsPage'
 import ReturnDetailPage from './pages/ReturnDetailPage'
 import ClaimItemPage from './pages/ClaimItemPage'
 import NotificationsPage from './pages/NotificationsPage'
+import AdminPage from './pages/admin/AdminPage'
 import { useEffect, useState } from 'react'
 
 /** 导航栏上那个未读数（#31）。
@@ -88,6 +90,10 @@ export default function App() {
               {/* 通知入口只给登录的人看：#30 的收件人取自 JWT，匿名点进去只会先被守卫弹回登录页，
                   而那一下弹回会让人以为是自己点错了。 */}
               <NavNotifications />
+              {/* 后台入口只给 role=admin 的人看。判据取自 #3 而不是手里的 token（token 里没有 role），
+                  所以刚提权的人刷新一次就会出现，被降权的人刷新一次就消失。
+                  这一条只是少给一个必然 403 的链接，真正的门在后端那个 admin 组上。 */}
+              {user?.role === 'admin' && <Link to="/admin">管理</Link>}
               <span className="who">
                 {user?.nickname}
                 <button className="link-btn" type="button" onClick={logout}>
@@ -212,6 +218,20 @@ export default function App() {
             element={
               <RequireAuth>
                 <NotificationsPage />
+              </RequireAuth>
+            }
+          />
+
+          {/* 片 6：管理后台。两道门是故意的，各管一种失误 ——
+              RequireAuth 挡「匿名连请求都不该发」，RequireAdmin 挡「非 admin 进来只会看到五个 403」。
+              真正的权限判定在后端 router.go 那个 admin 组里（role 每请求回库重读一次）。 */}
+          <Route
+            path="/admin"
+            element={
+              <RequireAuth>
+                <RequireAdmin>
+                  <AdminPage />
+                </RequireAdmin>
               </RequireAuth>
             }
           />
