@@ -146,23 +146,26 @@ func Load() (Config, error) {
 // /api/debug/config 用的就是它。
 func (c Config) Redacted() map[string]any {
 	return map[string]any{
-		"env":                    c.Env,
-		"port":                   c.Port,
-		"log_level":              c.LogLevel,
-		"db_host":                c.DBHost,
-		"db_port":                c.DBPort,
-		"db_user":                c.DBUser,
-		"db_name":                c.DBName,
-		"db_password":            mask(c.DBPassword),
-		"jwt_secret":             mask(c.JWTSecret),
-		"jwt_expire_hours":       int(c.JWTExpire.Hours()),
-		"upload_dir":             c.UploadDir,
-		"match_notify_threshold": c.Match.NotifyThreshold,
-		"match_show_threshold":   c.Match.ShowThreshold,
-		"match_decay_days":       c.Match.DecayDays,
-		"hduhelp_app_id":         mask(c.HDUHelpAppID),
-		"hduhelp_app_secret":     mask(c.HDUHelpAppSecret),
-		"sso_state_key":          mask(c.SSOStateKey),
+		"env":              c.Env,
+		"port":             c.Port,
+		"log_level":        c.LogLevel,
+		"db_host":          c.DBHost,
+		"db_port":          c.DBPort,
+		"db_user":          c.DBUser,
+		"db_name":          c.DBName,
+		"db_password":      mask(c.DBPassword),
+		"jwt_secret":       mask(c.JWTSecret),
+		"jwt_expire_hours": int(c.JWTExpire.Hours()),
+		// 四个可调参数一个都不能少：§9 造这个端点的理由是「调参前先问一句现在生效的是多少」，
+		// 少吐一个就等于那个参数只能靠猜。时间容差以前是漏的那个。
+		"upload_dir":                 c.UploadDir,
+		"match_time_tolerance_hours": c.Match.TimeToleranceHours,
+		"match_notify_threshold":     c.Match.NotifyThreshold,
+		"match_show_threshold":       c.Match.ShowThreshold,
+		"match_decay_days":           c.Match.DecayDays,
+		"hduhelp_app_id":             mask(c.HDUHelpAppID),
+		"hduhelp_app_secret":         mask(c.HDUHelpAppSecret),
+		"sso_state_key":              mask(c.SSOStateKey),
 	}
 }
 

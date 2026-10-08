@@ -133,6 +133,20 @@ req GET /api/debug/config '' "$M6_ad_TOK"
 check '   admin 且 ENV=dev → HTTP 200（生产环境这条路由压根不注册）' '200' "$STATUS"
 check '   env 这一格是 dev' '"env":"dev"' "$BODY"
 check '   jwt_secret 打码成 ***（config.Redacted 是唯一的脱敏出口）' '"jwt_secret":"***"' "$BODY"
+# ---------- 匹配参数：四个键一个都不能少 ----------
+# §9 造这个端点的唯一理由就是「调参之前先问一句现在生效的是多少」。
+# 少吐一个键，那个参数就又只能靠猜 —— 而 MatchConfig 有四个字段，
+# Redacted 漏掉其中一个时，测试里数一下 `"match_` 的次数就能当场发现（时间容差以前就是漏的那个）。
+check_re '   匹配参数一共四个键（少一个就是 Redacted 和 MatchConfig 脱节了）' '^4$' "$(count_in_body '"match_')"
+# 拿 .env 里的值和响应里的值对一遍，证明这个键不是硬编码在 Redacted 里的装饰。
+# 兜底 24 必须和 config.Load 里 getInt("MATCH_TIME_TOLERANCE_HOURS", 24) 那句同值 ——
+# 两边各写一份默认值，是这类断言最容易悄悄失效的方式（.env 没这个键时尤其明显）。
+# ⚠ 和上面那条 jwt_secret 检查一样的已知局限：envval 读的是 backend/.env，
+#   而如果服务是用真环境变量 MATCH_TIME_TOLERANCE_HOURS 起的，那边的优先级更高，
+#   这条会比出一个假红。dev 用 .env 启动，所以这里不额外处理。
+M6_TOL="$(envval MATCH_TIME_TOLERANCE_HOURS)"; M6_TOL="${M6_TOL:-24}"
+check_re "   match_time_tolerance_hours 是个数字，且等于 .env 里的取值（$M6_TOL）" \
+  "\"match_time_tolerance_hours\":$M6_TOL([,}])" "$BODY"
 # ⚠ 这一段故意不打印 BODY：它检查的正是「响应里有没有泄漏密钥」，
 #   泄漏的时候把响应贴出来等于二次泄漏。只打印长度，长度足够排除「空值」这种巧合。
 M6_SECRET="$(envval JWT_SECRET)"

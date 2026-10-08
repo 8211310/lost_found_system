@@ -324,6 +324,30 @@ func TestM6DebugConfigIsAdminOnlyAndMasked(t *testing.T) {
 		t.Errorf("阈值没有原样吐出来：%v / %v（期望 0.75 / 0.55）",
 			data["match_notify_threshold"], data["match_show_threshold"])
 	}
+	// 另外两个也必须原样吐出来。上面那条只点了两个阈值，而 MatchConfig 有四个字段 ——
+	// 「阈值都对了」给人「匹配参数验全了」的错觉，时间容差就是这么漏掉的。
+	// 和第③层那条数 `"match_` 次数的冒烟是同一件事的两层：这里锁「Redacted 和 MatchConfig 脱节」，
+	// 冒烟锁「正在跑的那个进程真的读了 backend/.env」。
+	// 类型分支不是多余：值如果被塞进 mask()，响应里会是 "***"，
+	// 而 `float64 != "***"` 这种比较在 any 上是恒假、不会报错的 —— 所以先 switch 出类型。
+	for _, tc := range []struct {
+		key  string
+		want float64
+	}{
+		{"match_time_tolerance_hours", float64(harness.Cfg.Match.TimeToleranceHours)},
+		{"match_decay_days", float64(harness.Cfg.Match.DecayDays)},
+	} {
+		switch v := data[tc.key].(type) {
+		case nil:
+			t.Errorf("匹配参数里少了 %s —— config.Redacted 漏了 MatchConfig 的字段", tc.key)
+		case float64:
+			if v != tc.want {
+				t.Errorf("%s=%v，期望夹具 cfg 里的真值 %v", tc.key, v, tc.want)
+			}
+		default:
+			t.Errorf("%s 的值类型是 %T，期望数字 —— 匹配参数不是密钥，它不该被 mask 掉", tc.key, v)
+		}
+	}
 	if data["env"] != "test" {
 		t.Errorf("env=%v，期望 test（这个键没脱敏，也正是排查时第一眼要看的那一列）", data["env"])
 	}
