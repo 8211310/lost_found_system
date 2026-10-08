@@ -249,7 +249,7 @@ it(`admin 凭据：${hasAdmin ? '已提供，第二节真打' : '未提供 —�
   if (!hasAdmin) {
     console.warn(
       '⚠ 未设置 LIVE_ADMIN_USER / LIVE_ADMIN_PASS：#9–#12 的形状、两级/三级上限、同名冲突、' +
-        '两种删不掉的障碍，以及 #39 那 17 个键，一行都没真打。',
+        '两种删不掉的障碍，以及 #39 那 18 个键，一行都没真打。',
     )
   }
   expect(hasAdmin).toBe(ADMIN_USER !== '' && ADMIN_PASS !== '')
@@ -633,7 +633,7 @@ describe.skipIf(!hasAdmin)('#39 真读到的那一份配置（admin 真打）', 
     cfg = await call<DebugConfig>('GET', '/api/debug/config', token)
   })
 
-  it('data 恰好是那 17 个键：一个不多、一个不少', async () => {
+  it('data 恰好是那 18 个键：一个不多、一个不少', async () => {
     expect(cfg).not.toBeNull()
     expectExactKeys(cfg!, [
       'env',
@@ -647,6 +647,7 @@ describe.skipIf(!hasAdmin)('#39 真读到的那一份配置（admin 真打）', 
       'jwt_secret',
       'jwt_expire_hours',
       'upload_dir',
+      'match_time_tolerance_hours',
       'match_notify_threshold',
       'match_show_threshold',
       'match_decay_days',
@@ -658,12 +659,18 @@ describe.skipIf(!hasAdmin)('#39 真读到的那一份配置（admin 真打）', 
     // 后端多一列 → 前端 DebugTab 的「还没归组」那一栏会显示它；后端少一列 → 这里先红。
   })
 
-  it('时间容差不在那份 map 里：后端没吐，前端就不许显示它', async () => {
-    expectAbsent(cfg!, ['match_time_tolerance_hours', 'match_time_tolerance'])
-    // ⚠ 这一条红了只有两种走法，别直接删：
-    //   ① 后端把 MATCH_TIME_TOLERANCE_HOURS 加进了 config.Redacted() —— 那是好事，
-    //      于是 DebugTab 里那句「匹配有四个参数、这里只有三个」和 types.ts 的注释要一起改；
-    //   ② 改名或挪了位置 —— 那 DebugTab 的分组表要跟着改。
+  it('match_ 这一族恰好四个键：「这一页就是为这四个数存在的」才说得出口', async () => {
+    // 后端 MatchConfig 恰好四个字段，smoke/m6-governance.sh 数的也是同一个「四」。
+    // 2026-10-08 之前漏的是时间容差，那一版这里只数到 3，前端那句说明写的是「只吐三个」。
+    const family = Object.keys(cfg!)
+      .filter((k) => k.startsWith('match_'))
+      .sort()
+    expect(family).toEqual([
+      'match_decay_days',
+      'match_notify_threshold',
+      'match_show_threshold',
+      'match_time_tolerance_hours',
+    ])
   })
 
   it('敏感那五列只有两种形状：*** 或者 (未配置)，不会是空串、也不会漏出原值', async () => {
@@ -675,12 +682,15 @@ describe.skipIf(!hasAdmin)('#39 真读到的那一份配置（admin 真打）', 
     }
   })
 
-  it('三个匹配参数是数字不是字符串，而两个阈值都落在 0~1 里', async () => {
+  it('四个匹配参数是数字不是字符串，而两个阈值都落在 0~1 里', async () => {
     const show = cfg!.match_show_threshold
     const notify = cfg!.match_notify_threshold
     expect(typeof show).toBe('number')
     expect(typeof notify).toBe('number')
     expect(typeof cfg!.match_decay_days).toBe('number')
+    // 时间容差必须是**数**：它跟那五个敏感键走的是同一条出口，一旦误过 mask() 就变成 `"***"`，
+    // 而 `"***"` 在页面上看着完全合理 —— 只有类型能把它抓住。
+    expect(typeof cfg!.match_time_tolerance_hours).toBe('number')
     for (const [k, v] of [
       ['match_show_threshold', show],
       ['match_notify_threshold', notify],
@@ -689,6 +699,9 @@ describe.skipIf(!hasAdmin)('#39 真读到的那一份配置（admin 真打）', 
       expect(v, `${k} 不在 (0,1] 里`).toBeLessThanOrEqual(1)
     }
     expect(cfg!.match_decay_days).toBeGreaterThan(0)
+    // 容差这里只钉「不是负数」：0 是有人真想「只认同一小时」时会写进 .env 的值，
+    // 后端也允许它（config.go 只解析、不设下限），所以断言 >0 会把一次合法的调参变成一条假红。
+    expect(cfg!.match_time_tolerance_hours).toBeGreaterThanOrEqual(0)
 
     // 「展示线低于通知线」是设计口径（0.55 < 0.75），但它不是数据库里的恒等式，
     // 而是 .env 里两个数 —— 有人调参就会动它。所以这里**警告而不是失败**：

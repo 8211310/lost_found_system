@@ -28,6 +28,7 @@ function sampleConfig(extra: Record<string, unknown> = {}) {
     jwt_secret: '***',
     jwt_expire_hours: 24,
     upload_dir: './uploads',
+    match_time_tolerance_hours: 24,
     match_notify_threshold: 0.75,
     match_show_threshold: 0.55,
     match_decay_days: 14,
@@ -63,7 +64,7 @@ function valueOf(label: RegExp): string {
 }
 
 describe('读到了配置', () => {
-  it('三个匹配参数带着它们的环境变量名 —— 这一页存在的理由就是这一格', async () => {
+  it('四个匹配参数带着它们的环境变量名 —— 这一页存在的理由就是这一格', async () => {
     mockConfig()
     renderRouted('/admin', <DebugTab />, '/admin')
 
@@ -74,10 +75,12 @@ describe('读到了配置', () => {
     expect(screen.getByText(/MATCH_SHOW_THRESHOLD/)).toBeInTheDocument()
     expect(valueOf(/^通知线/)).toContain('0.75')
     expect(screen.getByText(/MATCH_NOTIFY_THRESHOLD/)).toBeInTheDocument()
-    expect(valueOf(/衰减天数/)).toContain('14')
+    expect(valueOf(/^衰减天数/)).toContain('14')
     expect(screen.getByText(/MATCH_DECAY_DAYS/)).toBeInTheDocument()
+    expect(valueOf(/^时间容差/)).toContain('24')
+    expect(screen.getByText(/MATCH_TIME_TOLERANCE_HOURS/)).toBeInTheDocument()
     // 展示线必须排在通知线前面讲得通的那条口径：0.55 < 0.75，两个数都要看得见才比得出。
-    expect(screen.getByText(/这一页主要就是为这三个数存在的/)).toBeInTheDocument()
+    expect(screen.getByText(/这一页主要就是为这四个数存在的/)).toBeInTheDocument()
   })
 
   it('打码那几列原样显示，并且说清那不是内容', async () => {
@@ -101,14 +104,16 @@ describe('读到了配置', () => {
     expect(valueOf(/^upload_base_url$/)).toBe('/uploads')
   })
 
-  it('时间容差这一项后端没吐：页面上说明这件事，而且不许编一个值出来', async () => {
-    mockConfig()
+  it('时间容差显示的是后端给的那个数，不是这一页自己填的 24', async () => {
+    // 夹具默认就是 24（.env 里那套），所以这里换一个别的值：
+    // 直接拿默认值断言「24 在页面上」分不清那个 24 是读来的还是写死的。
+    mockConfig(sampleConfig({ match_time_tolerance_hours: 48 }))
     renderRouted('/admin', <DebugTab />, '/admin')
 
     await screen.findByText('当前环境')
-    expect(screen.getByText(/MATCH_TIME_TOLERANCE_HOURS/)).toBeInTheDocument()
-    // 这一句钉的是「没有这一行」：后端那份 map 里没有这个键，前端不能替它填一个 24。
-    expect(screen.queryByText(/^时间容差/, { selector: 'dt' })).not.toBeInTheDocument()
+    expect(valueOf(/^时间容差/)).toContain('48')
+    // 而它不该同时出现在「还没归组」那一栏 —— 出现在那里意味着这张表漏了一行。
+    expect(screen.queryByText('这一页还没归组的键')).not.toBeInTheDocument()
   })
 
   it('重读一次会真的再发一遍（改完 .env 重启之后要能看到数变了）', async () => {

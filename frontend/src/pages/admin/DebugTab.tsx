@@ -8,8 +8,9 @@
 //    所以「这一页显示不出来」必须分成两句不同的话说清楚，混成一句「加载失败」就变成假故障。
 // ② 后端 config.Redacted() 是唯一一处打码的出口，`***` 和 `(未配置)` 是它写出来的结果。
 //    前端这里**不再打一遍码**（两份「哪些键算敏感」迟早会不一致），也不许把它显示成空。
-// ③ 匹配有四个参数，这一条只吐三个（MATCH_TIME_TOLERANCE_HOURS 没进那份 map）。
-//    「看不到」不等于「没生效」，所以这句必须在页面上，而不是等下一个人来猜。
+// ③ 匹配那四个参数后端全吐（时间容差是 2026-10-08 才补进那份 map 的）。所以这一页少一个数
+//    就是这一张表少写了一行，而不是后端没给 —— 兜住这件事的是下面的 leftovers()，
+//    它读的是接口里**这份声明不认识**的那些键。
 import { useCallback, useEffect, useState } from 'react'
 import { getDebugConfig } from '../../api/admin'
 import { ApiError } from '../../api/client'
@@ -37,11 +38,12 @@ const GROUPS: { title: string; rows: Row[] }[] = [
     ],
   },
   {
-    title: '匹配（这一页主要就是为这三个数存在的）',
+    title: '匹配（这一页主要就是为这四个数存在的）',
     rows: [
       { key: 'match_show_threshold', label: '展示线', env: 'MATCH_SHOW_THRESHOLD' },
       { key: 'match_notify_threshold', label: '通知线', env: 'MATCH_NOTIFY_THRESHOLD' },
       { key: 'match_decay_days', label: '衰减天数', env: 'MATCH_DECAY_DAYS' },
+      { key: 'match_time_tolerance_hours', label: '时间容差（小时）', env: 'MATCH_TIME_TOLERANCE_HOURS' },
     ],
   },
   {
@@ -192,8 +194,7 @@ export default function DebugTab() {
           <p className="hint">
             这一页没有任何写入的按钮：配置进的是环境变量，改完要重启进程才生效，
             而这一条只是把<strong>已经生效的那一份</strong>念给你听。
-            匹配一共有四个参数，这里只有三个 —— 时间容差（MATCH_TIME_TOLERANCE_HOURS）
-            后端没把它放进那份打码结果，所以看不到它不等于它没生效。
+            匹配的那四个数各自对应一个环境变量，改哪一个都先回这里看一眼现在是多少。
           </p>
         </>
       )}

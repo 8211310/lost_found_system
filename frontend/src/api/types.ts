@@ -99,8 +99,9 @@ export interface DictResult {
 /** #39 GET /api/debug/config 的 data —— 后端 config.Redacted() 那份打码后的运行时配置。
  *  ⚠ 敏感那几列到这里时已经是 `"***"` 或 `"(未配置)"`，前端**不需要**也不该再打码，
  *  但也不许把整包原样打印到控制台或写进任何日志：打码只有一份出口，多一份就多一份失误机会。
- *  ⚠ 匹配有四个参数，这一条只吐三个：`match_time_tolerance_hours` 不在 Redacted 的键里。
- *  所以这里没有它，页面上也不许给它编一个默认值显示出来。 */
+ *  ⚠ 匹配那四个参数**全都在**这份 map 里（时间容差是 2026-10-08 后端补上的第 18 个键）。
+ *  所以这一页少显示一个数，就是前端这张表的漏项，不是后端没吐 —— DebugTab 的
+ *  「还没归组」那一栏就是用来兜住这件事的。 */
 export interface DebugConfig {
   env: string
   port: string
@@ -113,6 +114,7 @@ export interface DebugConfig {
   jwt_secret: string
   jwt_expire_hours: number
   upload_dir: string
+  match_time_tolerance_hours: number
   match_notify_threshold: number
   match_show_threshold: number
   match_decay_days: number
