@@ -176,6 +176,78 @@ describe('登录但不是发帖人', () => {
   })
 })
 
+describe('归还确认（#23）的入口', () => {
+  // 这一组断言的对象是**隐藏**：#23 后端不要求先解锁，所以技术上四个分支都能点进去，
+  // 但点进去拿到的是 VALIDATION（lost 帖）、ITEM_CLOSED（closed/deleted）、RETURN_SELF（本人）。
+  // 一个「点了必报错」的链接比没有链接更糟，所以判据要跟后端那三道门一模一样。
+  it('解锁成功之后，联系方式下面给出「提交归还确认」这条链接', async () => {
+    const user = userEvent.setup()
+    setToken('jwt.xiaoli')
+    mockMe(sampleUser({ id: 7 }))
+    mockDetail(sampleItemView())
+    server.use(
+      http.post(`${BASE}/api/items/:id/unlock-contact`, () =>
+        HttpResponse.json(
+          ok({ contact: '微信 bbb', unlocked_at: '2026-10-07T00:00:00Z', already_unlocked: false }),
+        ),
+      ),
+    )
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await user.click(await screen.findByRole('button', { name: '认领并查看联系方式' }))
+
+    const link = await screen.findByRole('link', { name: /提交归还确认/ })
+    expect(link).toHaveAttribute('href', '/items/202/claim')
+  })
+
+  it('联系方式还锁着时不给这条链接（顺序是先联系上，后登记）', async () => {
+    setToken('jwt.xiaoli')
+    mockMe(sampleUser({ id: 7 }))
+    mockDetail(sampleItemView())
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('捡到黑色长款钱包')
+    expect(screen.queryByRole('link', { name: /提交归还确认/ })).not.toBeInTheDocument()
+  })
+
+  it('lost 帖就算联系方式公开也不给 —— #23 只认 found 帖，点了必吃 VALIDATION', async () => {
+    setToken('jwt.xiaoli')
+    mockMe(sampleUser({ id: 7 }))
+    mockDetail(sampleItemView({ item_type: 'lost', title: '丢了一张校园卡', contact: '微信 aaa', contact_locked: false }))
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('微信 aaa')
+    expect(screen.queryByRole('link', { name: /提交归还确认/ })).not.toBeInTheDocument()
+  })
+
+  it('帖子已经 closed 就不给（之前解锁过的人再进来就是这一格）', async () => {
+    setToken('jwt.xiaoli')
+    mockMe(sampleUser({ id: 7 }))
+    mockDetail(sampleItemView({ status: 'closed', contact: '微信 bbb', contact_locked: false }))
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('微信 bbb')
+    expect(screen.queryByRole('link', { name: /提交归还确认/ })).not.toBeInTheDocument()
+  })
+
+  it('发帖人本人看不到这条链接（#23 给他的是 RETURN_SELF）', async () => {
+    setToken('jwt.xiaowan')
+    mockMe(sampleUser({ id: 8, username: 'xiaowan', nickname: '小王' }))
+    mockDetail(sampleItemView({ author: { id: 8, nickname: '小王' } }))
+
+    renderRouted('/items/:id', <ItemDetailPage />, '/items/202')
+
+    await screen.findByText('捡到黑色长款钱包')
+    expect(screen.queryByRole('link', { name: /提交归还确认/ })).not.toBeInTheDocument()
+    // 对照：同一页上属于作者的那套操作是在的，说明这条不是「整页都没渲染」造成的假绿。
+    expect(screen.getByRole('button', { name: '标记为已归还' })).toBeInTheDocument()
+  })
+})
+
 describe('发帖人本人', () => {
   it('自己的 found 帖联系方式直接可见，没有认领按钮', async () => {
     setToken('jwt.xiaowang')

@@ -171,6 +171,12 @@ export default function ItemDetailPage() {
   // #16/#17 后端虽然允许 admin，但那条路要带 admin_reason，它的入口在管理后台（片 5），
   // 所以这里对 admin 也不出现按钮 —— 不是做不到，是点下去只会吃一个他自己看不懂的 VALIDATION。
   const isOwner = status === 'authed' && user?.id === item.author.id
+  // 归还确认（#23）的入口条件跟后端那四道门一一对齐：found 帖（lost 帖后端给 VALIDATION）、
+  // open（closed/deleted 吃 ITEM_CLOSED）、不是本人（RETURN_SELF）、已登录。
+  // 而它只挂在「联系方式已经看得到」那一格里：#23 后端**不要求**先解锁，
+  // 但顺序上登记本来就是「联系上、东西到手」之后的那一步，排在拿到电话之前会误导。
+  const canSubmitReturn =
+    status === 'authed' && !isOwner && item.item_type === 'found' && item.status === 'open'
   // deleted 的帖子什么都不能再动：#16 在这种状态上返回 ITEM_CLOSED，
   // #18 也一样。所以这一栏整块不出现，而不是给了按钮再报错。
   const canAct = isOwner && item.status !== 'deleted'
@@ -247,6 +253,13 @@ export default function ItemDetailPage() {
           <>
             <p className="contact-value">{contact}</p>
             {unlockHint && <p className="hint">{unlockHint}</p>}
+            {canSubmitReturn && (
+              <p className="hint">
+                <Link className="link-btn" to={`/items/${item.id}/claim`}>
+                  东西已经到手了？提交归还确认
+                </Link>
+              </p>
+            )}
           </>
         ) : item.contact_locked ? (
           <>
