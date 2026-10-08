@@ -192,6 +192,9 @@ it(`admin 凭据：${hasAdmin ? '已提供，第二节真打' : '未提供 —�
 
 describe.skipIf(!hasAdmin)('#34 GET /api/admin/users（admin 真打）', () => {
   beforeAll(async () => {
+    // vitest 4 的 describe.skipIf 只跳测试、不跳钩子：没有凭据时这里照跑，
+    // 报出来的是「登不上」，看着像 admin 门坏了，其实只是没人给 LIVE_ADMIN_USER。
+    if (!hasAdmin) return
     let token = ''
     try {
       const r = await call<{ token: string }>('POST', '/api/auth/login', undefined, {
@@ -287,6 +290,7 @@ describe.skipIf(!hasAdmin)('#37 #48 #50（admin 真打）', () => {
   let token = ''
 
   beforeAll(async () => {
+    if (!hasAdmin) return
     const r = await call<{ token: string }>('POST', '/api/auth/login', undefined, {
       username: ADMIN_USER,
       password: ADMIN_PASS,

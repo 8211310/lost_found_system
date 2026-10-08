@@ -117,9 +117,12 @@ export default function DebugTab() {
     return () => {
       dead = true
     }
-  }, [seq])
+  }, [])
 
-  useEffect(() => load(), [load])
+  // seq 是「重读一次」的扳机：load 不读它，读的是**它的变化**，而那件事只有 effect 的依赖表表达得了。
+  useEffect(() => {
+    load()
+  }, [load, seq])
 
   return (
     <>

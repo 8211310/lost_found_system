@@ -322,9 +322,14 @@ export default function DictTab() {
     return () => {
       dead = true
     }
-  }, [seq])
+  }, [])
 
-  useEffect(() => load(), [load])
+  // seq 是「重读一次」的扳机：它不进 load 的身体（load 不读它），只在这里换掉 effect 的依赖。
+  // 写成 useCallback([seq]) 的话 lint 会报那个依赖是多余的 —— 它确实不被读取，
+  // 被读取的是**它的变化**，而那件事只有 effect 的依赖表能表达。
+  useEffect(() => {
+    load()
+  }, [load, seq])
 
   return (
     <>
