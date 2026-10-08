@@ -12,6 +12,7 @@
 // 唯一接近的那件事是删掉一行归还确认，而那是销毁记录，不是判定归还。
 import { useSearchParams } from 'react-router-dom'
 import ActionsTab from './ActionsTab'
+import DebugTab from './DebugTab'
 import DictTab from './DictTab'
 import ReportsTab from './ReportsTab'
 import StatsTab from './StatsTab'
@@ -27,6 +28,8 @@ const TABS = [
   // 这两块不在计划 §M7 钉的那五个页签里，接的是后端早就做完、前端一直没接的 #9–#12 和 #39
   // （2026-10-08 用户要求「后端做完了前端全量跟进」）。
   { value: 'dict', label: '字典', El: DictTab },
+  // ⚠ 「诊断」这一页在生产环境永远显示一句「这条路由没注册」：那是它该有的样子，不是坏了。
+  { value: 'debug', label: '诊断', El: DebugTab },
 ] as const
 
 type AdminTab = (typeof TABS)[number]['value']

@@ -1,11 +1,11 @@
-// src/pages/admin/AdminPage.test.tsx —— 那一页六个页签的外壳。
+// src/pages/admin/AdminPage.test.tsx —— 那一页七个页签的外壳。
 //
 // 这里钉两件在代码里最容易悄悄坏掉的事：
 // ① 顺序和默认页签。计划 §M7 给的是「用户 / 举报待办 / 批量下架 / 操作日志 / 统计」这个次序
 //    （先看清人 → 再看待办 → 才动手 → 回头看账），默认停在用户：
 //    刚进后台的人第一眼该是「这系统里有谁」，不是一片勾选框。
-//    「字典」排在最后，因为它不在 §M7 那五个里，是 2026-10-08 补的 #9–#12。
-// ② 换页签时上一个页签的查询参数必须丢掉。六个页签共用一条地址，
+//    「字典」和「诊断」排在最后，因为它们不在 §M7 那五个里，是 2026-10-08 补的 #9–#12 和 #39。
+// ② 换页签时上一个页签的查询参数必须丢掉。所有页签共用一条地址，
 //    而它们的筛选参数**同名不同义**：#34 的 status 是 active/banned，
 //    #48 的 status 是 open/resolved/dismissed，#14 的 status 是 open/closed/deleted。
 //    带过去不会安静地返回空列表，而是后端那条 VALIDATION ——
@@ -31,7 +31,7 @@ import { renderRouted } from '../../test/render'
 import { server } from '../../test/server'
 import { setToken } from '../../api/session'
 
-const TAB_NAMES = ['用户', '举报待办', '批量下架', '操作日志', '统计', '字典']
+const TAB_NAMES = ['用户', '举报待办', '批量下架', '操作日志', '统计', '字典', '诊断']
 
 /** #3 的身份刻意用 id=7 的管理员，和下面 #34 行里的 id=12 岔开：
  *  「这是你自己」那一格只该在该出现的时候出现。 */
@@ -47,7 +47,7 @@ function tabGroup() {
 }
 
 describe('页签条', () => {
-  it('六个页签按钉住的顺序排，默认停在「用户」并发出 #34', async () => {
+  it('七个页签按钉住的顺序排，默认停在「用户」并发出 #34', async () => {
     let usersCalls = 0
     asAdmin()
     server.use(
@@ -166,6 +166,27 @@ describe('换页签', () => {
     expect(calls.categories).toBe(1)
     expect(calls.locations).toBe(1)
     expect(calls.users).toBe(0)
+  })
+
+  it('诊断页签打的是 /api/debug/config，它不在 /api/admin 那个组里', async () => {
+    const calls = { adminUsers: 0, debug: 0 }
+    asAdmin()
+    server.use(
+      http.get(`${BASE}/api/admin/users`, () => {
+        calls.adminUsers += 1
+        return HttpResponse.json(ok(samplePage([])))
+      }),
+      http.get(`${BASE}/api/debug/config`, () => {
+        calls.debug += 1
+        return HttpResponse.json(ok({ env: 'dev', port: '8080' }))
+      }),
+    )
+
+    renderRouted('/admin', <AdminPage />, '/admin?tab=debug')
+
+    expect(await screen.findByText('当前环境')).toBeInTheDocument()
+    expect(calls.debug).toBe(1)
+    expect(calls.adminUsers).toBe(0)
   })
 })
 
