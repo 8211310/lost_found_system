@@ -85,6 +85,42 @@ export interface LocationNode {
   children: LocationNode[]
 }
 
+/** #9/#11 的 data：刚建出来的那一行（service.DictResult）。
+ *  ⚠ 没有 sort_order，也没有「第几级以下不能再挂」以外的任何回显 —— 想立刻看到新条目
+ *  只能重读 #7/#8，而这一片就是靠重读刷新的。
+ *  parent_id 是 null 而不是缺键：一级条目**没有**父节点，和「父节点 id 是 0」是两件事。 */
+export interface DictResult {
+  id: number
+  name: string
+  level: number
+  parent_id: number | null
+}
+
+/** #39 GET /api/debug/config 的 data —— 后端 config.Redacted() 那份打码后的运行时配置。
+ *  ⚠ 敏感那几列到这里时已经是 `"***"` 或 `"(未配置)"`，前端**不需要**也不该再打码，
+ *  但也不许把整包原样打印到控制台或写进任何日志：打码只有一份出口，多一份就多一份失误机会。
+ *  ⚠ 匹配有四个参数，这一条只吐三个：`match_time_tolerance_hours` 不在 Redacted 的键里。
+ *  所以这里没有它，页面上也不许给它编一个默认值显示出来。 */
+export interface DebugConfig {
+  env: string
+  port: string
+  log_level: string
+  db_host: string
+  db_port: string
+  db_user: string
+  db_name: string
+  db_password: string
+  jwt_secret: string
+  jwt_expire_hours: number
+  upload_dir: string
+  match_notify_threshold: number
+  match_show_threshold: number
+  match_decay_days: number
+  hduhelp_app_id: string
+  hduhelp_app_secret: string
+  sso_state_key: string
+}
+
 /** model.RefView —— 详情里字典条目的嵌套形状（{id, name}），不是平铺两列。 */
 export interface RefView {
   id: number

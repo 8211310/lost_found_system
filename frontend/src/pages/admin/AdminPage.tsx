@@ -1,4 +1,4 @@
-// src/pages/admin/AdminPage.tsx —— 管理后台那一页，五个页签（计划 §M7 钉的就是这五个）。
+// src/pages/admin/AdminPage.tsx —— 管理后台那一页，计划 §M7 钉的五个页签 + 字典（#9–#12）。
 //
 // 为什么是一页五个页签而不是五条路由：它们回答的是同一组问题的不同侧面
 // （这些人是谁 → 有什么在等着处理 → 现在动手 → 动过什么 → 这系统多大），
@@ -12,6 +12,7 @@
 // 唯一接近的那件事是删掉一行归还确认，而那是销毁记录，不是判定归还。
 import { useSearchParams } from 'react-router-dom'
 import ActionsTab from './ActionsTab'
+import DictTab from './DictTab'
 import ReportsTab from './ReportsTab'
 import StatsTab from './StatsTab'
 import TakedownTab from './TakedownTab'
@@ -23,6 +24,9 @@ const TABS = [
   { value: 'takedown', label: '批量下架', El: TakedownTab },
   { value: 'actions', label: '操作日志', El: ActionsTab },
   { value: 'stats', label: '统计', El: StatsTab },
+  // 这两块不在计划 §M7 钉的那五个页签里，接的是后端早就做完、前端一直没接的 #9–#12 和 #39
+  // （2026-10-08 用户要求「后端做完了前端全量跟进」）。
+  { value: 'dict', label: '字典', El: DictTab },
 ] as const
 
 type AdminTab = (typeof TABS)[number]['value']

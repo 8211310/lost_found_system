@@ -4,10 +4,15 @@
 // 依赖它做分支（分支永远写在 code 上），后端改了措辞页面不会坏。
 // NETWORK 也不在这里 —— 那种错误的 message 是 client.ts 里现写的排查提示，本来就该直接显示。
 //
-// ⚠ VALIDATION 刻意**不**进这张表。后端每次校验失败都把具体原因写在 message 上
+// ⚠ VALIDATION 和 CONFLICT 刻意**不**进这张表。后端每次校验失败都把具体原因写在 message 上
 // （apperr.Validation 的第一个参数就是那句人话，比如「用户名不能包含空格」），
 // 前端替它编一句「填写的内容有不对的地方」只会更差 —— 用户看不到该改哪个字段。
 // 字段级的定位靠 ApiError.errorFor(field)，那条路径各表单自己用。
+//
+// CONFLICT 进这张表是同一个坑：backend 里三个抛它的地方（repo/dict.go 的同名兄弟 ×2、
+// repo/pgerr.go）都各带一句具体话，而 codes.go 那句默认「资源冲突」从来没单独出现过。
+// 覆盖成「和已有数据冲突了」等于把「同一个上级下面已经有一个同名的分类了」这种
+// 正好告诉人该怎么办的句子藏起来。
 import { Code } from './codes'
 import { ApiError } from './client'
 
@@ -20,7 +25,6 @@ const TEXT: Record<string, string> = {
   [Code.USER_ALREADY_EXISTS]: '这个用户名已经被注册了，换一个',
   [Code.WEAK_PASSWORD]: '密码至少 8 位，且不能是纯数字',
   [Code.OLD_PASSWORD_WRONG]: '原密码不正确',
-  [Code.CONFLICT]: '和已有数据冲突了',
   [Code.INTERNAL]: '服务器出错了，请带上页面下方显示的请求编号反馈',
 
   // 下面三条属于归还确认流（#23）。措辞要守后端那份禁词表（TestNoticeCopyMakesNoPlatformPromise

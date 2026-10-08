@@ -1,4 +1,4 @@
-// src/api/admin.ts —— 管理后台用到的十二条端点：#34–#37、#43–#46、#47–#50。
+// src/api/admin.ts —— 管理后台用到的端点：#9–#12、#34–#37、#39、#43–#50。
 //
 // 这一族的边界（定位原则 5 + §12 M6 那条 TestNoAdminCommunityRoutesExist）：
 // **admin 能销毁内容和账号，但不能制造归属。** 所以这里没有、也永远不该出现
@@ -6,14 +6,17 @@
 // #46 删除一条归还确认是销毁，#25/#26 那两个推进流程的端点对 admin 一律 FORBIDDEN。
 // 页面上任何「顺手帮 ta 点了吧」的冲动都会在这里变成一次编译期检查失败（因为函数根本不存在）。
 //
-// 鉴权全部由后端 router.go 的那个组兜住（jwt → RequireAdmin，role 每请求回库读一次），
+// 鉴权全部由后端 router.go 兜住（jwt → RequireAdmin，role 每请求回库读一次），
 // 所以前端这一层不判权限、不缓存身份，只做「把请求发对形状」。
+// ⚠ 只有 #39 不在那个组里：它挂在 api 上，多出来的半个条件是「ENV=dev」，
+// 由注册那一行的 if 表达（见 handler/debug.go 那两道闸）。
 //
-// ⚠ 后端还有五条能力当前**没有** UI：#9–#12（字典增删，计划 §M7 只钉了五个页签，
-// 而字典改名压根没有端点、走 Adminer）和 #39（GET /api/debug/config，
-// 且它在生产环境里**这条路由压根不注册**，不是「返回 403 的端点」）。
-// 按 items.ts 头上那条「用到才建」的约定，这里不给它们写没人调用的预留函数 ——
-// 死函数会被读者当成活的契约，将来它悄悄改了也没人发现。
+// ⚠ #9–#12 这四条只覆盖「新增」和「删除」两格：**改名和停用后端没有开端点**
+// （计划 §14-15 明写低频走数据库；表里那列 is_active 全 backend/internal 没有任何生产代码写过它）。
+// 所以这一族页面上不许出现「改名」按钮，也不许把「删了重加」当成改名的替代 ——
+// 那会改掉新条目的 id，而历史帖子引用的是 id。
+// #39（GET /api/debug/config）同样在这里，但它是**开发环境专属**：
+// 生产环境里 router.go 压根不注册这条路由，页面上必须把那个 404 如实显示出来。
 import { deleteJSON, getJSON, postJSON, putJSON } from './client'
 import { buildQuery } from './items'
 import { runeLen } from '../lib/runes'
@@ -24,6 +27,8 @@ import type {
   AdminStats,
   AdminTargetType,
   AdminUserRow,
+  DebugConfig,
+  DictResult,
   Page,
   ReportReasonCode,
   ReportResolution,
@@ -55,6 +60,26 @@ export function reasonProblem(raw: string): string {
   if (!trimmed) return '必须填写理由'
   const len = runeLen(trimmed)
   if (len > MAX_REASON_RUNES) return `理由最多 ${MAX_REASON_RUNES} 个字，当前 ${len} 个`
+  return ''
+}
+
+/** 字典条目的名字上限：categories.name 是 VARCHAR(32)，locations.name 是 VARCHAR(64)。
+ *  两个数不一样是列宽决定的，不是随手写的 —— 取共同的大值 64 去建分类会撞在 SQLSTATE 22001 上，
+ *  而那不是 TranslateConstraint 认得码，用户看到的是一条 500。 */
+export const MAX_CATEGORY_NAME_RUNES = 32
+export const MAX_LOCATION_NAME_RUNES = 64
+
+/** 两张字典各自的层级上限（迁移里那两条 CHECK level 钉死的）：分类两级、地点三级。
+ *  它是「谁有资格当上级」的判据：第 maxLevel 级下面再挂孩子，后端给的是 VALIDATION。 */
+export const CATEGORY_MAX_LEVEL = 2
+export const LOCATION_MAX_LEVEL = 3
+
+/** 名字那一格的前端预检，和后端 validateDictName 同三条：非空（trim 后）、不超列宽。 */
+export function dictNameProblem(raw: string, max: number): string {
+  const t = raw.trim()
+  if (!t) return '名字不能为空'
+  const len = runeLen(t)
+  if (len > max) return `最多 ${max} 个字，当前 ${len} 个`
   return ''
 }
 
@@ -255,4 +280,63 @@ export function adminDeleteItemImage(id: number, reason: string): Promise<null> 
  *  积分一点不动，帖子状态也一点不动。第二次删同一条是 NOT_FOUND。 */
 export function adminDeleteReturn(id: number, reason: string): Promise<null> {
   return deleteJSON<null>(`/api/admin/returns/${id}`, { reason })
+}
+
+/* ---------- #9–#12 字典 ---------- */
+
+/** 新建一条字典条目（#9 分类 / #11 地点）的请求体。
+ *  ⚠ `parent_id` 用 **undefined 表示「这个键不放进 JSON」**，不是放一个 0：
+ *  一级条目本来就没有父节点，而 0 不是任何一行的 id，
+ *  后端会在父节点点查那里报「上级不存在」—— 把正确请求判成错误，正是那两行注释的理由。
+ *  ⚠ 没有 level：那一列由 parent_id 现推（两张表的 CHECK 把「level=1 ⇔ parent_id IS NULL」钉死了），
+ *  传它等于给自己一个「传一个和 parent_id 互相矛盾的值」的机会。
+ *  is_freeform 只有地点认，分类那边传过去会被忽略（categories 表没这一列）。 */
+export interface NewDictEntry {
+  name: string
+  parent_id?: number
+  sort_order?: number
+  is_freeform?: boolean
+  reason: string
+}
+
+/** #9 POST /api/admin/categories。校验顺序：reason → name → 父节点存在且还塞得下。
+ *  ⚠ 同名兄弟撞的是唯一索引 uq_categories_sibling，给的是 409 CONFLICT
+ *  （「同一个上级下面已经有一个同名的分类了」），不是 VALIDATION。
+ *  ⚠ 这一条**写一行 admin_actions**（dict_create / category），所以 live 层的写测试删不掉那行账。 */
+export function createCategory(entry: NewDictEntry): Promise<DictResult> {
+  return postJSON<DictResult>('/api/admin/categories', entry)
+}
+
+/** #10 DELETE /api/admin/categories/:id（请求体只有 reason；空 body 吃 VALIDATION，
+ *  因为「为什么删」正是治理要留下的那件东西）。
+ *  ⚠ 删得掉的唯一条件是它**既没有子节点、也没有帖子引用**（那两条预检是兜底说明，
+ *  防线在数据库的外键上：items.category_id 没有 ON DELETE CASCADE）。
+ *  挡着的时候是 409 CATEGORY_IN_USE，而后端那句 message 会把数量数给人看：
+ *  「这个条目删不掉：下面还有 3 个子节点，并且有 12 条帖子正在引用它」。 */
+export function deleteCategory(id: number, reason: string): Promise<null> {
+  return deleteJSON<null>(`/api/admin/categories/${id}`, { reason })
+}
+
+/** #11 POST /api/admin/locations。与 #9 同形，多一列 is_freeform，名字上限换成 64。 */
+export function createLocation(entry: NewDictEntry): Promise<DictResult> {
+  return postJSON<DictResult>('/api/admin/locations', entry)
+}
+
+/** #12 DELETE /api/admin/locations/:id。规则同 #10，被挡时用的还是 CATEGORY_IN_USE 那个码
+ *  （它一句文案管着两张字典，所以页面上不能按码名去猜「这是分类还是地点」——只能读 message）。 */
+export function deleteLocation(id: number, reason: string): Promise<null> {
+  return deleteJSON<null>(`/api/admin/locations/${id}`, { reason })
+}
+
+/* ---------- #39 运行时配置 ---------- */
+
+/** #39 GET /api/debug/config：打码后的运行时配置（密钥那几列在这里已经是 "***" 或 "(未配置)"）。
+ *  ⚠ 它**不在 /api/admin 那个组里**，而是在 api 上带 jwt + RequireAdmin，
+ *  并且注册那一行外面套着 `if !cfg.IsProd()` —— 生产环境里这条路由压根不存在，
+ *  拿到的是 404 NOT_FOUND（不是 403）。handler 里那一道 prod 检查管的是「注册那行被改坏」，
+ *  两道闸各防一种失误。页面必须把 404 如实说成「这一条只在开发环境有」。
+ *  ⚠ 返回的键由后端 config.Redacted() 决定，多一个少一个都不报错；
+ *  字段名的真相在 contract.live 那一层，不在这份 interface 里。 */
+export function getDebugConfig(): Promise<DebugConfig> {
+  return getJSON<DebugConfig>('/api/debug/config')
 }
