@@ -376,3 +376,116 @@ export interface CreditHistory {
   page: number
   page_size: number
 }
+
+/** item_returns.status 的全部四种取值（model/item_return.go 的白名单，DB 有 CHECK 钉着）。
+ *  状态机只有四条边：pending → confirmed / rejected / cancelled，都是**单向不可逆**；
+ *  rejected 和 cancelled 之后同一个人**可以重新提交**一条新的（后端明写「这是设计不是漏洞」）。 */
+export type ReturnStatus = 'pending' | 'confirmed' | 'rejected' | 'cancelled'
+
+/** #24 里的提交人那一块。⚠ **没有 real_name**（model/item_return.go 刻意去掉），
+ *  带 credit_score 是为了让发帖人在「要不要确认」之前多看一眼对方的记录 ——
+ *  它是判断的**输入**，不是平台的结论。 */
+export interface SubmitterView {
+  id: number
+  nickname: string
+  credit_score: number
+}
+
+/** #25 confirm 的 data。credit_delta 是**调用者自己**那一份的封顶后增量（已经 200 分就是 0），
+ *  提交人的 +2 不在这个响应里 —— 别拿它当「双方各加了几分」显示。 */
+export interface ConfirmReturnResult {
+  id: number
+  status: string
+  reviewed_at: string
+  credit_delta: number
+}
+
+/** #26 reject 的 data：**根本没有 credit_delta 这个键**，连 0 都没有。
+ *  拒绝不扣分是这套系统的立场（拒绝只是「我没同意」，不是「你在撒谎」）。 */
+export interface DecideReturnResult {
+  id: number
+  status: string
+  reviewed_at: string
+}
+
+/** #23 的 data。status 恒为 'pending'，所以这个类型里没什么可判的。 */
+export interface SubmitReturnResult {
+  id: number
+  item_id: number
+  status: string
+  submitted_at: string
+}
+
+/** #27 的 data —— 只有两个键：后端**刻意不给** reviewed_at，
+ *  虽然库里那列填了值（撤销不是「处理」，给它一个处理时间就等于把它当成处理）。 */
+export interface CancelReturnResult {
+  id: number
+  status: string
+}
+
+/** #28 / #29 列表里的一行。
+ *  ⚠ 这一行**没有 message、没有 proof_image_path、没有 submitter**，
+ *  后端的理由是「列表是索引，详情才是判断现场」（model/item_return.go:156-161）。
+ *  所以列表页不许试着渲染证据，也不该在列表上放确认/拒绝按钮 —— 那是 #24 的活。
+ *  另外 cancelled 的行在这里**会带**非空 reviewed_at（和 #27 的响应不一致，以这里为准）。 */
+export interface ReturnEntry {
+  id: number
+  item: ItemSummary
+  status: ReturnStatus
+  owner_note: string
+  submitted_at: string
+  reviewed_at: string
+}
+
+/** #24 GET /api/returns/:id 的 data。
+ *
+ * 三个只有读源码才知道的点：
+ * ① `reviewed_at` 为空时是**空串**不是 null（后端 formatTime 把 NULL 折成 ""）；
+ *    `reviewer_id` / `review_kind` 才是真 null。两种「还没有」的表示法不一样，别写反。
+ * ② `review_kind` 只有 'owner' 和 'admin_data_fix' 两个值：前者是社区里真实发生过的判断，
+ *    后者是 admin 改数据、**没有任何社区含义**。页面上不许把两者显示成同一句「已处理」——
+ *    那等于替平台把「管理员改了库」说成「发帖人同意了」，正是定位原则 5 禁止的那件事。
+ * ③ `item.contact` 在这条路上恒为 null，`item.removal` 恒不出现；
+ *    而**帖子被删或被下架都不会让这条读不到**（记录是事实，item.status 只是回 'deleted'）。 */
+export interface ReturnDetailView {
+  id: number
+  item: ItemSummary
+  submitter: SubmitterView
+  message: string
+  proof_image_url: string
+  status: ReturnStatus
+  owner_note: string
+  reviewer_id: number | null
+  review_kind: 'owner' | 'admin_data_fix' | null
+  submitted_at: string
+  reviewed_at: string
+}
+
+/** notifications.type 的七种取值（model/notification.go 里那条 DB CHECK 的镜像）。
+ *  `contact_unlocked` 已经不存在了（§16 删的），别再为它写分支。 */
+export type NotificationType =
+  | 'new_match'
+  | 'return_submitted'
+  | 'return_confirmed'
+  | 'return_rejected'
+  | 'item_returned_hint'
+  | 'admin_action'
+  | 'report_resolved'
+
+/** #30 列表里的一条通知。
+ *
+ * ⚠ **不能只按 type 决定点去哪儿**：`item_id` 和 `return_id` 都可能是 null，
+ *  而且 `admin_action` 一种 type 底下藏着五种完全不同的事（下架、封号、警告、删图、删归还记录），
+ *  其中只有 #46 那条会带 return_id。所以跳转顺序是先看 return_id、再看 item_id、都没有就不给链接。
+ *  ⚠ 这两个 id **不是外键**，指向的东西可能已经没了 —— 点进去拿到 NOT_FOUND 是预期内的，
+ *  页面上要写「该内容已不存在」，不是「出错了」。 */
+export interface NotificationView {
+  id: number
+  type: NotificationType
+  title: string
+  content: string
+  item_id: number | null
+  return_id: number | null
+  is_read: boolean
+  created_at: string
+}

@@ -41,7 +41,7 @@ describe('身份与入口', () => {
     expect(seen.meTimes).toBe(1)
   })
 
-  it('四条入口都在，且没有通知中心 —— 那一页要到片 5 才存在，放着就是死链', async () => {
+  it('五条入口都在 —— 片 5 之后通知中心和归还记录这两条链接才允许出现', async () => {
     mockMe()
 
     renderRouted('/me', <MePage />, '/me')
@@ -50,7 +50,8 @@ describe('身份与入口', () => {
     expect(within(nav).getByRole('link', { name: '我的发布' })).toHaveAttribute('href', '/me/posts')
     expect(within(nav).getByRole('link', { name: '积分流水' })).toHaveAttribute('href', '/me/credit')
     expect(within(nav).getByRole('link', { name: '账号设置' })).toHaveAttribute('href', '/me/settings')
-    expect(within(nav).queryByRole('link', { name: /通知/ })).not.toBeInTheDocument()
+    expect(within(nav).getByRole('link', { name: /归还确认/ })).toHaveAttribute('href', '/me/returns')
+    expect(within(nav).getByRole('link', { name: /通知/ })).toHaveAttribute('href', '/me/notifications')
   })
 
   it('管理员看到的也是普通用户那几项，但有一句解释为什么没有后台', async () => {

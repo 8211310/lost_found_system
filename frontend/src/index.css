@@ -808,3 +808,156 @@ select:focus {
   font-size: 22px;
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- 片 5：归还确认流 + 通知中心 ---- */
+
+/* 顶栏那个未读小红点。它必须能被忽略：不用读通知的人不该被一个晃动的东西拽着，
+   所以它是静止的文字色块而不是闪烁动画，99+ 封顶也是为了不让顶栏被撑开。 */
+.badge {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 「我提交过的 / 别人提交给我的」这一族的行：一行一件事，纵向排，
+   手机上标题和状态挤在一行会看不清哪个是标题。 */
+.ret-list,
+.n-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+
+.ret-row,
+.n-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+
+.ret-row a,
+.n-head a {
+  color: var(--primary-dark);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+/* 归还状态用色块而不是灰字：这一页人要一眼扫出「哪些还等着我处理」，
+   而 pending 是唯一需要他动手的那个，所以它单独给琥珀色。 */
+.ret-state {
+  align-self: flex-start;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ret-state-pending {
+  background: #fff4e5;
+  border-color: #f0c48a;
+  color: #8a5310;
+}
+
+.ret-state-confirmed {
+  background: #eaf7ef;
+  border-color: #9fd4b4;
+  color: #1d6b3a;
+}
+
+.ret-state-rejected {
+  background: var(--danger-bg);
+  border-color: #f0b3ac;
+  color: var(--danger);
+}
+
+.ret-state-cancelled {
+  background: var(--bg);
+  color: var(--fg-muted);
+}
+
+.ret-note {
+  font-size: 13px;
+}
+
+.proof-picked {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.proof-img {
+  width: 140px;
+  height: 140px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+/* 字数计数器放在输入框下面右对齐，因为它跟着这个框走，不是一句独立的说明。
+   超限时才变红：常态下抢眼睛会让人以为已经填错了。 */
+.counter {
+  display: block;
+  margin-top: 4px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.counter.over {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.ret-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.alert-inline {
+  color: var(--danger);
+  font-size: 13px;
+}
+
+/* 未读的那一条整行给一点底色，而不只是靠 tag：
+   扫一屏通知时人找的是「哪几条我没看过」，行底色比右上角一个小标签先被看到。 */
+.n-unread {
+  background: #fbfcfe;
+  border-left: 3px solid var(--primary);
+  padding-left: 12px;
+  margin-left: -12px;
+}
+
+.n-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  margin: 0;
+  font-weight: 600;
+}
+
+.n-body {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.tag-new {
+  background: #eef4ff;
+  border-color: #a9c6f5;
+  color: var(--primary-dark);
+  font-weight: 600;
+}

@@ -36,8 +36,12 @@ export function renderRouted(path: string, element: ReactElement, at = '/') {
         <Routes>
           <Route path={path} element={element} />
           <Route path="/login" element={<p>登录页桩</p>} />
-          <Route path="/items/:id" element={<p>详情页桩</p>} />
           <Route path="/" element={<p>广场页桩</p>} />
+          {/* 这两条是别的页面的落点，桩就够用了：#23 提交成功后跳 /returns/:id，
+              而 /items/:id/claim 自己也要能跳回帖子详情。
+              装真页面只会把它们的请求掺进这个测试的 mock 里。 */}
+          <Route path="/items/:id" element={<p>详情页桩</p>} />
+          <Route path="/returns/:id" element={<p>归还详情桩</p>} />
         </Routes>
       </AuthProvider>
     </MemoryRouter>,

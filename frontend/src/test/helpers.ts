@@ -12,9 +12,13 @@ import type {
   ItemView,
   LocationNode,
   LoginResult,
+  NotificationView,
   Page,
   RegisterResult,
   RemovalView,
+  ReturnDetailView,
+  ReturnEntry,
+  SubmitterView,
   UnlockerView,
   UserView,
 } from '../api/types'
@@ -213,4 +217,65 @@ export function sampleCreditHistory(
   overrides: Partial<Omit<CreditHistory, 'list'>> = {},
 ): CreditHistory {
   return { credit_score: 105, list, total: list.length, page: 1, page_size: 20, ...overrides }
+}
+
+/* ---------- 片 5：归还确认流 + 通知中心 ---------- */
+
+/** #24 里的提交人。默认**带 credit_score**：提交人要看的正是「这个人的信用分是多少」，
+ *  而这一族里唯一带 real_name 的是 #22 的 UnlockerView，这里没有那一列 —— 别在页面上显示真名。 */
+export function sampleSubmitter(overrides: Partial<SubmitterView> = {}): SubmitterView {
+  return { id: 12, nickname: '小李', credit_score: 103, ...overrides }
+}
+
+/** #28 / #29 列表里的一条。
+ *  默认是 **pending**：这一页的主用法就是「还欠几个判断」，忘了覆盖的测试会落在主分支上。
+ *  ⚠ 列表行里没有 message / proof_image_url / submitter —— 夹具也不能给，
+ *  给了就会掩盖「判断必须进 #24」这条约束。 */
+export function sampleReturnEntry(overrides: Partial<ReturnEntry> = {}): ReturnEntry {
+  return {
+    id: 501,
+    item: sampleSummary({ id: 202, item_type: 'found', title: '捡到黑色长款钱包', author_id: 8, author_name: '小王' }),
+    status: 'pending',
+    owner_note: '',
+    submitted_at: '2026-10-07T06:00:00Z',
+    reviewed_at: '',
+    ...overrides,
+  }
+}
+
+/** #24 的详情。默认 pending、还没人定过：reviewer_id / review_kind 是**真 null**，
+ *  而 reviewed_at 是空串不是 null —— 这两个「还没有」在后端是两种表示法，夹具必须照抄。 */
+export function sampleReturnDetail(overrides: Partial<ReturnDetailView> = {}): ReturnDetailView {
+  return {
+    id: 501,
+    item: sampleSummary({ id: 202, item_type: 'found', title: '捡到黑色长款钱包', author_id: 8, author_name: '小王' }),
+    submitter: sampleSubmitter(),
+    message: '钱包夹层里有一张校园卡，卡面右下角磨掉了一块，里面有校园卡和两百现金',
+    proof_image_url: '/uploads/2026/10/proof-a.jpg',
+    status: 'pending',
+    owner_note: '',
+    reviewer_id: null,
+    review_kind: null,
+    submitted_at: '2026-10-07T06:00:00Z',
+    reviewed_at: '',
+    ...overrides,
+  }
+}
+
+/** #30 里的一条通知。默认 item_id=202、return_id=null（能点进帖子的那种）。
+ *  ⚠ 两个 id 都可能为 null，而 type 决定不了落点，所以「不给链接」那条分支必须单独测。
+ *  title 刻意写成「后端会生成的那种具体句子」而不是类型名：这一页同时显示 type 的名字和 title，
+ *  两者同名会让任何按文字找元素的测试都变成「找到两个」。 */
+export function sampleNotification(overrides: Partial<NotificationView> = {}): NotificationView {
+  return {
+    id: 701,
+    type: 'return_submitted',
+    title: '小李向《捡到黑色长款钱包》提交了一次归还确认',
+    content: '他写了一句说明，并上传了一张凭证图。等你给出答复。',
+    item_id: 202,
+    return_id: null,
+    is_read: false,
+    created_at: '2026-10-07T06:00:00Z',
+    ...overrides,
+  }
 }

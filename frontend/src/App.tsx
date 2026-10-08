@@ -1,10 +1,13 @@
 // src/App.tsx —— 页面外壳 + 路由表。
 //
-// 路由表就是里程碑的进度表：广场、详情、发帖改帖删帖、「我的」那一族四页已经通，
+// 路由表就是里程碑的进度表：广场、详情、发帖改帖删帖、「我的」那一族四页、
+// 归还确认流（详情/两个列表/提交）、通知中心已经通，
 // 后面每一片往里加，没做的不放链接（放着就是死链）。
-import { Link, Route, Routes } from 'react-router-dom'
+import { Link, Route, Routes, useLocation } from 'react-router-dom'
 import { RequireAuth } from './auth/RequireAuth'
 import { useAuth } from './auth/AuthContext'
+import { getUnreadCount } from './api/notifications'
+import { onUnreadCountChanged } from './api/unreadBus'
 import LoginPage from './pages/LoginPage'
 import MePage from './pages/MePage'
 import PlazaPage from './pages/PlazaPage'
@@ -16,6 +19,54 @@ import MyPostsPage from './pages/MyPostsPage'
 import ContactViewsPage from './pages/ContactViewsPage'
 import CreditLogsPage from './pages/CreditLogsPage'
 import SettingsPage from './pages/SettingsPage'
+import MyReturnsPage from './pages/MyReturnsPage'
+import ReturnDetailPage from './pages/ReturnDetailPage'
+import ClaimItemPage from './pages/ClaimItemPage'
+import NotificationsPage from './pages/NotificationsPage'
+import { useEffect, useState } from 'react'
+
+/** 导航栏上那个未读数（#31）。
+ *
+ * 为什么在每次换页时重读一次：这套系统没有推送（不做站内私信、不做长连接是定稿的边界），
+ * 所以「有没有新通知」只能靠读。标完已读、确认完归还之后回到别的页面，人期望那个数字是新的。
+ * 代价是每换一页多一条 #31 —— 它就是一条走 idx_notifications_user 的 count，
+ * 后端特意把未读数和收件箱做成两条端点，正是为了让这种高频读便宜。
+ * ⚠ 读失败时显示的是「通知」而不是「通知 0」：拿不到数字和数字是 0 是两件事。
+ * 除换页之外还订阅 unreadBus 那一个信号：人站在收件箱里把未读清零时 pathname 没变，
+ * 只靠换页的话，他刚做完的事和顶上那个数会当场对不上。 */
+function NavNotifications() {
+  const location = useLocation()
+  const [count, setCount] = useState<number | null>(null)
+
+  useEffect(() => {
+    let dead = false
+    const read = () =>
+      getUnreadCount()
+        .then((res) => {
+          if (!dead) setCount(res.count)
+        })
+        .catch(() => {
+          if (!dead) setCount(null)
+        })
+    read()
+    // 换页读一次之外还要订阅这个信号：标完已读时人正站在收件箱里， pathname 没变，
+    // 只靠换页的话徽标会一直挂着那个刚刚被自己清零的数。
+    const off = onUnreadCountChanged(read)
+    return () => {
+      dead = true
+      off()
+    }
+  }, [location.pathname])
+
+  return (
+    <Link to="/me/notifications">
+      {/* 「通知」和数字之间必须有一个真正的空格：写成 通知{count} 时无障碍树里读出来是「通知3」，
+          读屏软件会把两个字粘成一个词。没数字时尾部那个空格会被归一化掉，名字就还是「通知」。 */}
+      通知 {count ? <span className="badge">{count > 99 ? '99+' : count}</span> : null}
+    </Link>
+  )
+}
+
 
 export default function App() {
   const { status, user, logout } = useAuth()
@@ -26,17 +77,24 @@ export default function App() {
         <Link to="/" className="brand">
           失物招领
         </Link>
-        <nav className="nav">
+        {/* 这一页之外还有 MePage 那个 <nav aria-label="我的那一族">：两个 nav 不加名字时，
+            读屏念「导航」人不知道自己在哪一块，测试也只能靠顺序猜。 */}
+        <nav className="nav" aria-label="主导航">
           <Link to="/">广场</Link>
           <Link to="/post">发布</Link>
           <Link to="/me">我的</Link>
           {status === 'authed' ? (
-            <span className="who">
-              {user?.nickname}
-              <button className="link-btn" type="button" onClick={logout}>
-                退出
-              </button>
-            </span>
+            <>
+              {/* 通知入口只给登录的人看：#30 的收件人取自 JWT，匿名点进去只会先被守卫弹回登录页，
+                  而那一下弹回会让人以为是自己点错了。 */}
+              <NavNotifications />
+              <span className="who">
+                {user?.nickname}
+                <button className="link-btn" type="button" onClick={logout}>
+                  退出
+                </button>
+              </span>
+            </>
           ) : (
             <Link to="/login">登录</Link>
           )}
@@ -118,6 +176,42 @@ export default function App() {
             element={
               <RequireAuth>
                 <ContactViewsPage />
+              </RequireAuth>
+            }
+          />
+
+          {/* 片 5：归还确认流 + 通知中心。四条全要登录 ——
+              #23 是写操作，#24 的读者是提交人/发帖人/admin（匿名连读都读不到），
+              #28/#29 的收件人取自 JWT，#30/#31/#32 更是只有「你」这一个视角。 */}
+          <Route
+            path="/items/:id/claim"
+            element={
+              <RequireAuth>
+                <ClaimItemPage />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/returns/:id"
+            element={
+              <RequireAuth>
+                <ReturnDetailPage />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/me/returns"
+            element={
+              <RequireAuth>
+                <MyReturnsPage />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/me/notifications"
+            element={
+              <RequireAuth>
+                <NotificationsPage />
               </RequireAuth>
             }
           />

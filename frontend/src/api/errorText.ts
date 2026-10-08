@@ -22,6 +22,14 @@ const TEXT: Record<string, string> = {
   [Code.OLD_PASSWORD_WRONG]: '原密码不正确',
   [Code.CONFLICT]: '和已有数据冲突了',
   [Code.INTERNAL]: '服务器出错了，请带上页面下方显示的请求编号反馈',
+
+  // 下面三条属于归还确认流（#23）。措辞要守后端那份禁词表（TestNoticeCopyMakesNoPlatformPromise
+  // 禁 归还成功 / 已归还给你 / 已关闭 / 这就是 / 判定）：前端在这里同样**不许**替平台下结论。
+  // 比如 RETURN_ILLEGAL_TRANSITION 不能写成「这条已经处理完了」——处理完是「帖子归还成功了」
+  // 的委婉说法，而平台记录的只是「发帖人做过一次 confirm/reject/cancel」这个事实。
+  [Code.RETURN_SELF]: '这条帖子是你自己发的，不需要向自己提交归还确认。',
+  [Code.RETURN_DUPLICATE]: '你为这条帖子提交的那一次还在等对方处理，不用重复提交。',
+  [Code.RETURN_ILLEGAL_TRANSITION]: '这一条的状态已经变了，页面上显示的是最新的那一版。',
 }
 
 export function errorText(err: unknown): string {
