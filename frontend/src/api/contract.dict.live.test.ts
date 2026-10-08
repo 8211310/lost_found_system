@@ -478,14 +478,33 @@ describe.skipIf(!hasAdmin)('#11 #12 地点：三级建到底 + is_freeform + 64 
     expect(tooLongLoc.errorFor('name')).toBeDefined()
   })
 
-  it('DELETE 连请求体都不给是 VALIDATION：那个 reason 不是可选的', async () => {
-    // 空 body 打一个**不存在**的 id：如果后端先查行再校验 body，这里会先变成 NOT_FOUND。
-    // 拿到 VALIDATION 就说明「删东西必须留下为什么」这条纪律排在查库之前。
+  it('DELETE 连请求体都不给：VALIDATION 停在 JSON 解析那一步，不在 reason 那一格', async () => {
+    // 后端这里有两件**不同**的事，混成一句「reason 必填」就会漏掉前一件：
+    //   压根没有 body   → 「请求体不是合法的 JSON」，data 是 null，一个字段错都没有；
+    //   {} / reason 空白 → 「必须填写理由」，data.errors 里点名 reason（见下面那一节）。
+    // 而它拿的是 VALIDATION 而不是 NOT_FOUND，钉的是顺序：解析 body 排在查库之前。
     const e = await expectCode(Code.VALIDATION, () =>
-      live.request({ method: 'DELETE', url: `/api/admin/locations/${id3}`, headers: { Authorization: `Bearer ${seed.tokenAdmin}` } }),
+      live.request({
+        method: 'DELETE',
+        url: `/api/admin/locations/${MISSING_ID}`,
+        headers: { Authorization: `Bearer ${seed.tokenAdmin}` },
+      }),
     )
-    expect(e.errorFor('reason'), `空请求体那句没落在 reason 上：${JSON.stringify(e.fieldErrors)}`).toBeDefined()
-    // 而且那一行必须还在（VALIDATION 发生在数子节点之前，更发生在 DELETE 之前）。
+    expect(e.fieldErrors, `空 body 却报出了字段错：那句「不是合法的 JSON」搬进校验层了`).toHaveLength(0)
+  })
+
+  it('DELETE 给了合法 JSON 但没带 reason：这一句才落在 reason 上，而且那一行还在', async () => {
+    // 用真实存在的 id3 打：这样「行还在」才有得验，而 VALIDATION 确实在数子节点、
+    // 更在 DELETE 之前发生。
+    const e = await expectCode(Code.VALIDATION, () =>
+      live.request({
+        method: 'DELETE',
+        url: `/api/admin/locations/${id3}`,
+        headers: { Authorization: `Bearer ${seed.tokenAdmin}` },
+        data: {},
+      }),
+    )
+    expect(e.errorFor('reason'), `缺 reason 那句没落在 reason 上：${JSON.stringify(e.fieldErrors)}`).toBeDefined()
     const tree = await call<LocationNode[]>('GET', '/api/locations')
     expect(findById(tree, id3)).not.toBeNull()
   })

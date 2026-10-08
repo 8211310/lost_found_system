@@ -11,5 +11,11 @@ export default defineConfig({
     // 顺带也验证了 client.ts 在无浏览器环境下能跑（session.ts 的内存兜底那条路径）。
     environment: 'node',
     include: ['src/**/*.live.test.ts'],
+    // 七个文件打的是**同一个开发库**，所以必须串行。有一条判据就是这么红的：
+    // contract.admin.live 里那条「读完四条只读端点，留痕总数一点没变」，
+    // 并行时会被 contract.dict.live 那两条写字典（各留一行 admin_actions）踩过去，
+    // 报出「112 != 110」—— 后端没错，是两个文件在同一张表上互相 interference。
+    // 同理还有统计里的那些计数。串行跑完全程也就几秒，不值得为它冒假红的险。
+    fileParallelism: false,
   },
 })

@@ -282,6 +282,8 @@ describe.skipIf(!hasAdmin)('#34 GET /api/admin/users（admin 真打）', () => {
     for (const p of READ_PATHS) await call('GET', p, seed.tokenAdmin)
     const after = await call<AdminStats>('GET', '/api/admin/stats', seed.tokenAdmin)
     // #50 那本账是「唯一的防线是事后可追责」的证据，所以读它不能产生新的账。
+    // ⚠ 这条判据的前提是**整个 live 套件串行**（vitest.live.config.ts 的 fileParallelism: false）：
+    //   字典那一份文件每建/删一条就写一行 admin_actions，并行时会把这里踩成「多了两行」的假红。
     expect(after.admin_actions_count).toBe(seed.actionsBefore)
   })
 })
