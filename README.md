@@ -28,6 +28,7 @@
 ├── docker-compose.yml           # postgres + adminer，只跑这两个
 ├── scripts/
 │   ├── setup-postgres.sh        # 原生 Windows PostgreSQL 的初始化脚本
+│   ├── dev-admin.sh             # 把某个已存在的本地账号提成 admin（第一个 admin 只能进库）
 │   ├── smoke.sh                 # 冒烟脚本的运行器：选节、补依赖、跑前置检查
 │   └── smoke/                   # 判据本体，一个里程碑一个文件 + lib.sh
 └── backend/
@@ -591,7 +592,25 @@ bash scripts/smoke.sh --list     # 看有哪些节、谁依赖谁
     「备份 → 改一处 → 跑对应那一条 → 还原 → `diff -q` 确认逐字节相同」），九次全部由绿转红，
     包括把 SQL 里那个 `'ids'` 改成 `'nope'` 之后第③层精确红在 6 条、而 `target_id`
     那一支（page=50）依然绿。
-- **待办**：M7 前端 · M8 杭电助手 SSO（外部阻塞中）
+- **2026-10-08 收尾两件：#39 的第 18 个键 + 第一个 admin 的入口**
+  - `config.Redacted()` 以前只吐 `MatchConfig` 四个字段里的三个，漏的是 `match_time_tolerance_hours`。
+    §9 造这个端点的唯一理由就是「调参前先问一句现在生效的是多少」，少吐一个键那个参数就还只能靠猜。
+    两层各钉一件事：第②层锁「`Redacted` 和 `MatchConfig` 脱节」（并且先 `switch` 出类型 ——
+    值被误塞进 `mask()` 时 `any` 上的 `float64 != "***"` 恒真不报错），
+    第③层数响应里 `"match_` 恰好四次、再拿 `backend/.env` 的取值对一遍，证明它不是硬编码的装饰。
+    前端那侧（`api/types.ts` / `DebugTab` / 单测 / live 键集）同一天跟进。
+  - `scripts/dev-admin.sh`：把「第一个 admin 只能进库」这件事做成一条有闸的命令。
+    提角色那条 #35 自己挂在 `RequireAdmin` 后面，而迁移里刻意没有种子 admin，所以这一步无法从
+    HTTP 引导出来；以前它藏在 m6 冒烟脚本里。脚本幂等、**绝不静默建号**、`ENV=prod` 直接拒绝
+    （它只有一句 `UPDATE`、不写 `admin_actions`，§10 风险 8 那道「事后可追责」在这里是失效的，
+    所以它不能出现在 prod）。顺带查实一台机器上的坑：原生 Windows 的 `psql.exe` 行尾是 CRLF，
+    `lib.sh` 的 `db()` 原样透出，只做「数字/子串」比较时看不出来，一做精确等值就恒为假 ——
+    等值比较一律走 `dev-admin.sh` 里那层 `db_clean`。
+  - 这一轮重测三层的口径：纯单测仍 **794**（新增的两条断言在 `TestM6DebugConfigIsAdminOnlyAndMasked`
+    里面，顶层函数数不变）、集成 `smoketest` **607**（207 个顶层、0 FAIL 0 SKIP）、
+    `scripts/smoke.sh` 全量 **598 项全绿、0 跳过**，其中 m6 一节 **151**（多的正是那两条）。
+- **待办**：只剩 M8 杭电助手 SSO（外部阻塞中，见 `docs/杭电助手第三方登录-调研与接口契约.md`）。
+  M7 前端已于 2026-10-08 全部完成（七个页签 + 归还确认流 + 通知中心，见 `frontend/README.md`）。
 
 路由清单见 `internal/router/router.go` —— 那是 §4 全部 50 条路由的唯一注册点，
 每个里程碑的占位注释都标了对应的端点编号。
