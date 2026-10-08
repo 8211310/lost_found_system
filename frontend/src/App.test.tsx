@@ -93,12 +93,14 @@ describe('导航栏上的未读数', () => {
     const seen = mockShell(3)
 
     renderApp('/me')
-    await within(HEADER()).findByRole('link', { name: /通知/ })
+    // 等的是「通知 3」而不是 /通知/：没有数字时那条链接也叫「通知」，
+    // 于是下面那句会在这次 GET 落地之前就被读到 0（上面和下面那两条都是靠带数字的全名避开的）。
+    await within(HEADER()).findByRole('link', { name: '通知 3' })
     expect(seen.unreadTimes).toBe(1)
 
     await user.click(screen.getByRole('link', { name: '广场' }))
-    await within(HEADER()).findByRole('link', { name: /通知/ })
-    expect(seen.unreadTimes).toBe(2)
+    // 换页之后旧数字还挂在顶上，所以按名字等是等不到新一次的：这里等的是请求本身发生了第二次。
+    await vi.waitFor(() => expect(seen.unreadTimes).toBe(2))
   })
 
   it('标完已读但没换页时也跟着重读：徽标不能停在人刚刚亲手清零的那个数上', async () => {

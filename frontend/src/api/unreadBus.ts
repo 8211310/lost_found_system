@@ -17,7 +17,8 @@ export function onUnreadCountChanged(fn: Listener): () => void {
   }
 }
 
-/** 任何让未读数发生变化的操作成功后调用（现在只有 #32 一处）。 */
+/** 任何让未读数发生变化的操作成功后调用。变化的来源只有 #32 那一条 PUT，
+ *  但页面上有两条路会打到它：按「标为已读」，和点开一条未读通知的落点。 */
 export function notifyUnreadCountChanged(): void {
   for (const fn of [...listeners]) fn()
 }

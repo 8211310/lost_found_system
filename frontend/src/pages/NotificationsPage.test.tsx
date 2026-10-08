@@ -7,8 +7,11 @@
 //      同一批连点两次第二次是 0 —— 按 ids.length 报数就是在报一件没发生过的事。
 //   ③ #32 的 body 只能有两种形状（只有 ids，或只有 {"all":true}）。`{"all":false}` 会被后端
 //      读成「没填 all」而落到全标已读那条路上，那是一个人一键把别人通知全标掉的入口。
+//   ④ 标已读有两条路（按钮 / 点开落点），两条都必须安静地只管这一条，而且都只发那两种形状之一。
+//      「点开落点」那条还要能在**不跳走**的情况下验（按住 Ctrl 点 = 开新标签页，这一页还活着），
+//      不然乐观翻转和失败不吭声这两件事在测试里根本观察不到 —— 一跳转整页就卸载了。
 //   另外：?read 是三态，'false' 必须真的发到线上（只看未读正是这一页的主用法）。
-import { screen, within } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { describe, expect, it, vi } from 'vitest'
@@ -152,6 +155,8 @@ describe('一条通知能点去哪里', () => {
     // 硬造一个 /items/ 的空链接比不给链接更坏：点开是一句「不存在」，而那条通知本来就没有落点。
     expect(within(row).queryByRole('link')).not.toBeInTheDocument()
     expect(within(row).getByText('你的 50 条帖子已被下架')).toBeInTheDocument()
+    // 没有落点就没有「点开即已读」这条路，那个按钮是这一行唯一的出口，不能顺手收掉。
+    expect(within(row).getByRole('button', { name: '标为已读' })).toBeInTheDocument()
   })
 
   it('类型那一行把七种取值都认得，未知的那种原样显示而不是空白', async () => {
@@ -164,6 +169,110 @@ describe('一条通知能点去哪里', () => {
     // 这一句讲的是这条通知的真实来历：发帖人确认过一次归还，而确认**不通知提交人以外的人**，
     // 所以收到它的只有匹配台账里的失物作者。
     expect(within(row).getByText(/你联系过的那条拾物帖，发帖人已确认过一次归还/)).toBeInTheDocument()
+  })
+})
+
+describe('点开落点也算已读', () => {
+  it('点标题：既跳去了落点，也把这一条标掉了，body 还是只发 ids', async () => {
+    const user = userEvent.setup()
+    const seen = mockFlow([sampleNotification({ id: 801 })], { updated: 1 })
+
+    renderRouted('/me/notifications', <NotificationsPage />, '/me/notifications')
+    const row = await rowOf('小李向《捡到黑色长款钱包》提交了一次归还确认')
+    await user.click(within(row).getByRole('link'))
+
+    // 看详情是目的，标已读是顺手，两件都必须成：跳转不能等 PUT，PUT 也不能拦住跳转。
+    expect(await screen.findByText('详情页桩')).toBeInTheDocument()
+    await waitFor(() => expect(seen.markTimes).toBe(1))
+    expect(seen.markBody).toEqual({ ids: [801] })
+    expect(Object.keys(seen.markBody as object)).toEqual(['ids'])
+  })
+
+  it('点开成功要发一次「未读数变了」：换页那一刻徽标读的是还没落库的数', async () => {
+    const user = userEvent.setup()
+    mockFlow([sampleNotification({ id: 801 })], { updated: 1 })
+    const rang = vi.fn()
+    const off = onUnreadCountChanged(rang)
+
+    try {
+      renderRouted('/me/notifications', <NotificationsPage />, '/me/notifications')
+      await user.click(within(await rowOf('小李向《捡到黑色长款钱包》提交了一次归还确认')).getByRole('link'))
+
+      // 这一句钉的是顺序，不是次数：Link 一点就换页，App 的徽标在换页时读一次 #31，
+      // 那次读多半早于 PUT 落库。没有这第二次唤起，徽标就永远停在标记之前的数上。
+      await waitFor(() => expect(rang).toHaveBeenCalledTimes(1))
+    } finally {
+      off()
+    }
+  })
+
+  it('按住 Ctrl 点（开新标签页，这一页还活着）：那一行的未读点和按钮当场消失，而且一声不吭', async () => {
+    const seen = mockFlow([sampleNotification({ id: 801 })], { updated: 1, unread: 5 })
+
+    renderRouted('/me/notifications', <NotificationsPage />, '/me/notifications')
+    const row = await rowOf('小李向《捡到黑色长款钱包》提交了一次归还确认')
+    expect(within(row).getByText('未读')).toBeInTheDocument()
+
+    // React Router 见到任何修饰键就不接管这次点击（把开新标签页的权力留给浏览器），
+    // 于是这一页没卸载 —— 乐观翻转在普通点击那条路上根本看不见，只有这一种点法能钉住它。
+    // 这里用 fireEvent 而不是 user.click：user-event 的 convenience click 不收修饰符参数，
+    // 事件上没带 ctrlKey， Router 照样把页面跳走了（console 里那两句 "Not implemented: navigation"
+    // 就是浏览器接管之后的事，正说明 Router 没拦）。
+    fireEvent.click(within(row).getByRole('link'), { ctrlKey: true })
+
+    expect(screen.queryByText('详情页桩')).not.toBeInTheDocument()
+    await waitFor(() => expect(within(row).queryByText('未读')).not.toBeInTheDocument())
+    expect(within(row).queryByRole('button', { name: '标为已读' })).not.toBeInTheDocument()
+
+    // 静默：这条路不许弹 mark() 那句「已标记 N 条」，也不重读整张列表（人没在管理收件箱）。
+    expect(screen.queryByText(/已标记/)).not.toBeInTheDocument()
+    expect(seen.listTimes).toBe(1)
+    // 顶部那句「还有 N 条没读过」是这一页自己的 state，跟着新读一次 #31，不能自己减一。
+    expect(seen.unreadTimes).toBe(2)
+  })
+
+  it('点开时那条 PUT 失败了：不报错、那一行还是未读、也不惊动徽标', async () => {
+    const seen = mockFlow([sampleNotification({ id: 801 })], { updated: 1 })
+    // 记次数的那个 handler 会被下面这条覆盖掉（msw 取最后注册的那条匹配），
+    // 所以前提「请求真的发出去了」只能在覆盖之后的 handler 里自己记。
+    let putTimes = 0
+    server.use(
+      http.put(`${BASE}/api/my/notifications/read`, () => {
+        putTimes += 1
+        return HttpResponse.json(envelope('INTERNAL', 'boom', 500).body, { status: 500 })
+      }),
+    )
+    const rang = vi.fn()
+    const off = onUnreadCountChanged(rang)
+
+    try {
+      renderRouted('/me/notifications', <NotificationsPage />, '/me/notifications')
+      const row = await rowOf('小李向《捡到黑色长款钱包》提交了一次归还确认')
+      fireEvent.click(within(row).getByRole('link'), { ctrlKey: true })
+
+      await waitFor(() => expect(putTimes).toBe(1))
+
+      // 已读只是元数据，不是这一趟跳转的前提，更不是一个值得单独报的错。
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      expect(within(row).getByText('未读')).toBeInTheDocument()
+      expect(within(row).getByRole('button', { name: '标为已读' })).toBeInTheDocument()
+      expect(rang).not.toHaveBeenCalled()
+      expect(seen.listTimes).toBe(1)
+    } finally {
+      off()
+    }
+  })
+
+  it('已经是已读的行点标题只是跳过去，不再发第二次 PUT', async () => {
+    const user = userEvent.setup()
+    const seen = mockFlow([sampleNotification({ id: 801, is_read: true })])
+
+    renderRouted('/me/notifications', <NotificationsPage />, '/me/notifications')
+    const row = await rowOf('小李向《捡到黑色长款钱包》提交了一次归还确认')
+    await user.click(within(row).getByRole('link'))
+
+    expect(await screen.findByText('详情页桩')).toBeInTheDocument()
+    expect(seen.markTimes).toBe(0)
   })
 })
 

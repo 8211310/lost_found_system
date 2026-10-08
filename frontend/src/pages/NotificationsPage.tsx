@@ -11,6 +11,10 @@
 // 落地页自己会说「不存在」，这里不许提前替它们担保「一定能打开」。
 //
 // ⚠ 已读**不可逆**：整个路由表里没有「标为未读」这条。所以「全部已读」必须二步确认。
+//
+// 标已读有两条路，打的都是同一条 #32：按「标为已读」按钮（会说话、会重读列表），
+// 和**点开这条通知的落点**（安静，见 markQuiet）。第二条是「打开即已读」这个通用语义，
+// 少它就是让人读完还得回头按一次。
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { getUnreadCount, listMyNotifications, markNotificationsRead } from '../api/notifications'
@@ -117,6 +121,32 @@ export default function NotificationsPage() {
     }
   }
 
+  // 点落点链接 = 看过了，所以顺手标这一条。这条路径和 mark() 共用那条 PUT，其余相反：
+  // 不弹提示（人是去看帖子/归还记录的，不是来管理收件箱的）、不吃 busy 那把锁让链接点不动。
+  //
+  // 失败也不吭声：那一行还是未读，导航栏那个数停在原样，想标还可以按按钮 ——
+  // 已读只是元数据，不该让一次网络抖动变成一句报错，更不该拦住这一趟跳转。
+  function markQuiet(n: NotificationView) {
+    markNotificationsRead({ ids: [n.id] })
+      .then(() => {
+        // 普通点击下这一页在点下去那一刻就卸载了，下面两句是空转；它们给的是按住 Ctrl/Cmd
+        // 开新标签页那种点法 —— 链接照样触发了这个 onClick，可这一页还活着、还显示着未读点，
+        // 那就得让行和顶部那句跟着变，否则同一页上「读过」和「没读过」各说一套。
+        setData((prev) =>
+          prev
+            ? { ...prev, list: prev.list.map((row) => (row.id === n.id ? { ...row, is_read: true } : row)) }
+            : prev,
+        )
+        loadUnread()
+        // 这一句才是普通点击那条路的重点：Link 一点就换页，App 的徽标在换页那一刻读一次 #31，
+        // 而那一次 PUT 多半还没落库，于是徽标读到的是标记之前的数、之后再没人提醒它。
+        notifyUnreadCountChanged()
+      })
+      .catch(() => {
+        // 静默，见上面那句「失败也不吭声」。
+      })
+  }
+
   const patch = useCallback(
     (next: Record<string, string>) => {
       const merged = new URLSearchParams(params)
@@ -215,14 +245,30 @@ export default function NotificationsPage() {
               <li key={n.id} className={n.is_read ? 'n-row' : 'n-row n-unread'}>
                 <p className="n-head">
                   {/* 有落点才做成链接：一条 50 帖批量下架的通知没有 item_id，
-                      硬造一个 /items/ 的空链接比不给链接更坏。 */}
-                  {href ? <Link to={href}>{n.title}</Link> : <span>{n.title}</span>}
+                      硬造一个 /items/ 的空链接比不给链接更坏。
+                      顺手在这里标已读：点进来看详情**就是**已读，不该还要回头按一次按钮。
+                      已经读过的（包括刚被这一条乐观翻过来的）不再发第二次请求。 */}
+                  {href ? (
+                    <Link
+                      to={href}
+                      onClick={() => {
+                        if (!n.is_read) markQuiet(n)
+                      }}
+                    >
+                      {n.title}
+                    </Link>
+                  ) : (
+                    <span>{n.title}</span>
+                  )}
                   {!n.is_read && <span className="tag tag-new">未读</span>}
                 </p>
                 <p className="n-body">{n.content}</p>
                 <p className="item-meta">
                   {TYPE_LABEL[n.type] ?? n.type} · {localMinute(n.created_at)}
                 </p>
+                {/* 有落点的行也留着这个键，不算重复：点标题会把你从列表里带走（第几页、
+                    滚到哪一行都没了），而「我知道有这回事，但现在不去」是另一个动作。
+                    没有落点的那些行（批量下架 50 条那种）只有这一条路。 */}
                 {!n.is_read && (
                   <p className="item-actions">
                     <button className="link-btn" type="button" disabled={busy} onClick={() => mark([n.id])}>
